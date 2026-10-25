@@ -374,6 +374,20 @@ function lockReasonText(reason) {
 }
 
 // Which card the picker shows.
+// The picker's card while omakeepickd is not reachable.
+function offlineTitle(service) {
+  if (!service) return "OmaKeePick service is not loaded"
+  if (service.installing) return "Installing the KeePass helper…"
+  if (service.daemonMissing) return "The KeePass helper is not installed"
+  return "Starting omakeepickd…"
+}
+
+function offlineSubtitle(service) {
+  if (!service || service.installing || !service.daemonMissing) return ""
+  var reason = String(service.installError || "")
+  return (reason ? reason + " · " : "") + "Run bin/install in the plugin folder"
+}
+
 function pickerView(connected, phase, quickUnlock, forceUnlock, useMasterPassword) {
   if (!connected) return "offline"
   if (phase === "unlocked" && !forceUnlock) return "search"
@@ -563,6 +577,8 @@ if (typeof module !== "undefined" && module.exports) {
     searchPlaceholder: searchPlaceholder,
     pinPlaceholder: pinPlaceholder,
     lockReasonText: lockReasonText,
+    offlineTitle: offlineTitle,
+    offlineSubtitle: offlineSubtitle,
     pickerView: pickerView,
     secondsUntil: secondsUntil,
     formatRemaining: formatRemaining,

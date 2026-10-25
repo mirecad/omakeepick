@@ -329,3 +329,14 @@ test("paths shorten under home", () => {
   assert.equal(Model.displayPath("/srv/x.kdbx", ""), "/srv/x.kdbx")
   assert.equal(Model.baseName("/a/b/Secrets.kdbx"), "Secrets.kdbx")
 })
+
+test("offline card explains a missing or installing helper", () => {
+  assert.equal(Model.offlineTitle(null), "OmaKeePick service is not loaded")
+  assert.equal(Model.offlineTitle({ installing: true, daemonMissing: true }), "Installing the KeePass helper…")
+  assert.equal(Model.offlineSubtitle({ installing: true, daemonMissing: true }), "")
+  assert.equal(Model.offlineTitle({ installing: false, daemonMissing: false }), "Starting omakeepickd…")
+  assert.equal(
+    Model.offlineSubtitle({ installing: false, daemonMissing: true, installError: "download failed" }),
+    "download failed · Run bin/install in the plugin folder"
+  )
+})

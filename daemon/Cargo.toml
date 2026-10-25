@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Helper daemon for the OmaKeePick Omarchy shell plugin: opens a KeePass KDBX database and serves search, copy and auto-type requests"
 license = "MIT"
+repository = "https://github.com/mirecad/omakeepick"
 authors = ["Miroslav Adamec"]
 publish = false
 

@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  daemon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: daemon
+      - run: cargo fmt --check
+        working-directory: daemon
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: daemon
+      - run: cargo test --locked
+        working-directory: daemon
+
+  model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: node --test tests/*.test.js
+      - name: Plugin and daemon versions match
+        run: |
+          plugin="$(jq -r .version manifest.json)"
+          daemon="$(sed -n 's/^version = "\(.*\)"/\1/p' daemon/Cargo.toml | head -1)"
+          test "$plugin" = "$daemon" || { echo "manifest.json $plugin != Cargo.toml $daemon"; exit 1; }

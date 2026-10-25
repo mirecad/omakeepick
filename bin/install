@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Installs omakeepickd, the plugin's helper daemon, as bin/omakeepickd next to this script.
+#
+#   bin/install           download the release binary for this plugin version and verify its
+#                         SHA-256; build from source with cargo if that is not possible
+#   bin/install --source  always build from source (needs rust: omarchy pkg add rust)
+#
+# The shell plugin runs this by itself when the binary is missing or older than the plugin.
+# A running daemon of another version is stopped (which locks the database) so the new one is
+# started on next use.
+set -euo pipefail
+
+repo="${OMAKEEPICK_REPO:-mirecad/omakeepick}"
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$root/manifest.json" | head -1)"
+target="$root/bin/omakeepickd"
+cache="${XDG_CACHE_HOME:-$HOME/.cache}/omakeepick"
+asset="omakeepickd-x86_64-linux"
+
+say() { echo "omakeepick install: $*" >&2; }
+
+[[ -n $version ]] || { say "cannot read the plugin version from manifest.json"; exit 1; }
+mkdir -p "$cache"
+work="$(mktemp -d "$cache/install.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+
+download() {
+  [[ $(uname -m) == x86_64 ]] || { say "no prebuilt binary for $(uname -m)"; return 1; }
+  command -v curl >/dev/null || { say "curl is not installed"; return 1; }
+  local base="https://github.com/$repo/releases/download/v$version"
+  say "downloading $asset $version from github.com/$repo"
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset" "$base/$asset" &&
+    curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset.sha256" "$base/$asset.sha256" ||
+    { say "download failed"; return 1; }
+  if ! (cd "$work" && sha256sum --check --status "$asset.sha256"); then
+    say "checksum mismatch, refusing the download"
+    return 1
+  fi
+  install -m 0755 "$work/$asset" "$work/omakeepickd"
+}
+
+build() {
+  local cargo
+  cargo="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
+  [[ -x $cargo ]] || { say "cargo is not installed (omarchy pkg add rust)"; return 1; }
+  say "building from source, this takes a minute"
+  # Build outside the plugin folder: the shell watches it and reloads on every change.
+  CARGO_TARGET_DIR="$cache/target" "$cargo" build --release --locked --quiet \
+    --manifest-path "$root/daemon/Cargo.toml" || { say "build failed"; return 1; }
+  install -m 0755 "$cache/target/release/omakeepickd" "$work/omakeepickd"
+}
+
+how=""
+if [[ ${1:-} != --source ]] && download; then
+  how="downloaded"
+elif build; then
+  how="built"
+else
+  say "could not install omakeepickd"
+  exit 1
+fi
+
+got="$("$work/omakeepickd" --version | cut -d' ' -f2)"
+[[ $got == "$version" ]] || say "warning: installed omakeepickd $got for plugin version $version"
+
+# Stop a daemon of another version; the plugin starts the new one.
+if [[ -x $target ]]; then
+  running="$("$target" ctl status 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || true
+  if [[ -n $running && $running != "$got" ]]; then
+    "$target" ctl quit >/dev/null 2>&1 || true
+  fi
+fi
+mv -f "$work/omakeepickd" "$target"
+say "installed omakeepickd $got ($how)"

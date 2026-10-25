@@ -813,11 +813,8 @@ Item {
 
         CardTitle {
           width: parent.width
-          title: !root.keepass ? "OmaKeePick service is not loaded"
-            : (root.keepass.daemonMissing ? "omakeepickd is not installed" : "Starting omakeepickd…")
-          subtitle: root.keepass && root.keepass.daemonMissing
-            ? "Build it with cargo build --release in daemon/, or place it at bin/omakeepickd"
-            : ""
+          title: Model.offlineTitle(root.keepass)
+          subtitle: Model.offlineSubtitle(root.keepass)
           dim: true
         }
       }
@@ -888,7 +885,7 @@ Item {
       textFormat: Text.PlainText
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      visible: root.unlocking || (cardTitle.dim && root.keepass !== null && !root.keepass.daemonMissing)
+      visible: root.unlocking || (cardTitle.dim && root.keepass !== null && (root.keepass.installing || !root.keepass.daemonMissing))
       text: "󰑐"
       color: root.foreground
       opacity: 0.58

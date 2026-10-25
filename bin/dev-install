@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Development install: builds omakeepickd and copies this working tree over the live plugin
+# folder, where the shell hot-reloads it. Restarts the daemon (which locks the database) so the
+# new binary is used. Pass --no-build to skip cargo.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+id="$(jq -r .id "$root/manifest.json")"
+dest="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$id"
+cargo="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
+
+if [[ ${1:-} != --no-build ]]; then
+  (cd "$root/daemon" && "$cargo" build --release --quiet)
+fi
+binary="$root/daemon/target/release/omakeepickd"
+[[ -x $binary ]] || { echo "dev-install: $binary is missing; build it first" >&2; exit 1; }
+
+omarchy plugin validate "$root" >/dev/null
+
+# The plugin folder gets the shell-side files only: the daemon sources and build tree would just
+# feed the shell's recursive file watcher.
+mkdir -p "$dest/bin"
+git -C "$root" ls-files --cached --others --exclude-standard -z -- \
+  ':!daemon' ':!.github' ':!docs' |
+  while IFS= read -r -d '' file; do
+    install -D -m "$( [[ -x $root/$file ]] && echo 0755 || echo 0644 )" "$root/$file" "$dest/$file"
+  done
+
+if ! cmp -s "$binary" "$dest/bin/omakeepickd"; then
+  "$dest/bin/omakeepickd" ctl quit >/dev/null 2>&1 || true
+  install -m 0755 "$binary" "$dest/bin/omakeepickd.new"
+  mv -f "$dest/bin/omakeepickd.new" "$dest/bin/omakeepickd"
+  echo "installed omakeepickd $("$dest/bin/omakeepickd" --version | cut -d' ' -f2)"
+fi
+echo "synced $id into $dest"

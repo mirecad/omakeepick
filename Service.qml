@@ -37,6 +37,8 @@ Item {
   readonly property bool connected: _connected
   readonly property bool daemonMissing: _daemonMissing
   readonly property string daemonPath: _daemonPath
+  readonly property bool installing: installer.running
+  readonly property string installError: _installError
 
   readonly property var daemonState: _state
   readonly property string phase: _state.phase
@@ -62,6 +64,11 @@ Item {
   property bool _connected: false
   property bool _daemonMissing: false
   property string _daemonPath: ""
+  // bin/install runs at most once per reason per shell session, so a failing
+  // download cannot loop.
+  property var _installTried: ({})
+  property string _installError: ""
+  property string _installLastLine: ""
   property bool _stopping: false
   property double _startedAt: 0
   property int _attempt: 0
@@ -252,6 +259,10 @@ Item {
       _connected = true
       _daemonMissing = false
       pushSettings(true)
+      // `omarchy plugin update` brings new QML but leaves the old binary.
+      var daemonVersion = String(message.version || "")
+      var pluginVersion = manifest && manifest.version ? String(manifest.version) : ""
+      if (daemonVersion && pluginVersion && daemonVersion !== pluginVersion) runInstall("outdated")
     }
     if (_state.phase !== "unlocked") clearResults()
   }
@@ -324,6 +335,7 @@ Item {
       console.warn("omakeepick: omakeepickd not found in " + pluginDirectory + "/bin or daemon/target")
     _daemonMissing = true
     _daemonPath = ""
+    if (runInstall("missing")) return
     // Someone may be building it right now; look again in a while.
     reconnect.interval = 10000
     reconnect.restart()
@@ -342,6 +354,47 @@ Item {
     _attempt += 1
     reconnect.restart()
     if (wasConnected) console.warn("omakeepick: lost omakeepickd (exit " + exitCode + "), reconnecting")
+  }
+
+  // Fetches (or builds) bin/omakeepickd; see bin/install.
+  function runInstall(reason) {
+    if (installer.running || _installTried[reason]) return false
+    _installTried[reason] = true
+    _installError = ""
+    _installLastLine = ""
+    if (reason === "missing") notify("OmaKeePick", "Installing the KeePass helper…", "low")
+    installer.reason = reason
+    installer.command = ["bash", pluginDirectory + "/bin/install"]
+    installer.running = true
+    return true
+  }
+
+  function installFinished(exitCode, reason) {
+    if (exitCode === 0) {
+      _installError = ""
+      if (reason === "missing") notify("OmaKeePick", "KeePass helper installed", "low")
+      // An outdated daemon was stopped by the installer; the bridge reconnects to the new one.
+      if (!_connected && !attach.running) {
+        reconnect.interval = 200
+        reconnect.restart()
+      }
+    } else {
+      _installError = _installLastLine || "bin/install failed"
+      notify("OmaKeePick", "Could not install the KeePass helper: " + _installError, "normal")
+      if (!_connected) daemonNotFound()
+    }
+  }
+
+  Process {
+    id: installer
+    property string reason: ""
+    stderr: SplitParser {
+      onRead: function(line) {
+        var text = String(line).replace(/^omakeepick install: /, "").trim()
+        if (text !== "") root._installLastLine = text
+      }
+    }
+    onExited: function(exitCode) { root.installFinished(exitCode, installer.reason) }
   }
 
   Process {

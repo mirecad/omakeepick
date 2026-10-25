@@ -8,7 +8,11 @@ qmllint="${QMLLINT:-/usr/lib/qt6/bin/qmllint}"
 
 echo "== manifest =="
 omarchy plugin validate "$root"
-echo "ok"
+plugin_version="$(jq -r .version "$root/manifest.json")"
+daemon_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$root/daemon/Cargo.toml" | head -1)"
+[[ $plugin_version == "$daemon_version" ]] ||
+  { echo "FAIL: manifest.json is $plugin_version but daemon/Cargo.toml is $daemon_version"; exit 1; }
+echo "ok ($plugin_version)"
 
 echo "== model =="
 node --test "$root/tests"/*.test.js
