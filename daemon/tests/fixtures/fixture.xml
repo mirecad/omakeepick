@@ -1,0 +1,132 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<KeePassFile>
+	<Meta>
+		<Generator>OmaKeePick test fixture</Generator>
+		<DatabaseName>Fixture</DatabaseName>
+		<RecycleBinEnabled>True</RecycleBinEnabled>
+		<RecycleBinUUID>CFIEyIXKUAu7nPmBTRKWHA==</RecycleBinUUID>
+	</Meta>
+	<Root>
+		<Group>
+			<UUID>0LJzx5XaVtGWUcBFRiqN/g==</UUID>
+			<Name>Root</Name>
+			<Group>
+				<UUID>FE9x19byXYyiChD3S2wbjg==</UUID>
+				<Name>Personal</Name>
+				<Group>
+					<UUID>pxAU3PByUM+ldNG9s+Sedw==</UUID>
+					<Name>Dev</Name>
+					<Entry>
+						<UUID>eiBUWGTqXW+Km3LBajGeww==</UUID>
+						<Tags>code;git</Tags>
+						<String><Key>Title</Key><Value>GitHub</Value></String>
+						<String><Key>UserName</Key><Value>madev</Value></String>
+						<String><Key>Password</Key><Value ProtectInMemory="True">gh-Pa55!</Value></String>
+						<String><Key>URL</Key><Value>https://github.com/login</Value></String>
+						<String><Key>Notes</Key><Value></Value></String>
+						<String><Key>otp</Key><Value ProtectInMemory="True">otpauth://totp/GitHub:madev?secret=JBSWY3DPEHPK3PXP&amp;issuer=GitHub&amp;period=30&amp;digits=6</Value></String>
+					</Entry>
+				</Group>
+				<Entry>
+					<UUID>zXLgtGtnXTa2epwFt8gKEw==</UUID>
+					<String><Key>Title</Key><Value>Bank</Value></String>
+					<String><Key>UserName</Key><Value>1234567</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">čšž-ľťň</Value></String>
+					<String><Key>URL</Key><Value>https://ib.bank.sk</Value></String>
+					<String><Key>Notes</Key><Value></Value></String>
+					<String><Key>PIN</Key><Value ProtectInMemory="True">4321</Value></String>
+					<String><Key>TOTP Seed</Key><Value ProtectInMemory="True">JBSWY3DPEHPK3PXP</Value></String>
+					<String><Key>TOTP Settings</Key><Value>30;6</Value></String>
+				</Entry>
+			</Group>
+			<Group>
+				<UUID>FqRFGxiHXtKQz4yaQcrqDw==</UUID>
+				<Name>Work</Name>
+				<Entry>
+					<UUID>0KfoWzEMVN+Z77cJVwQimw==</UUID>
+					<String><Key>Title</Key><Value>GitLab work</Value></String>
+					<String><Key>UserName</Key><Value>m.adamec</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">gl-secret</Value></String>
+					<String><Key>URL</Key><Value>https://gitlab.example.com</Value></String>
+					<String><Key>Notes</Key><Value></Value></String>
+					<AutoType>
+						<Enabled>True</Enabled>
+						<DataTransferObfuscation>0</DataTransferObfuscation>
+						<DefaultSequence>{USERNAME}{TAB}{TAB}{PASSWORD}{ENTER}</DefaultSequence>
+					</AutoType>
+				</Entry>
+				<Entry>
+					<UUID>VfUNIBpXWDaqKos2ek/6tw==</UUID>
+					<String><Key>Title</Key><Value>Jira</Value></String>
+					<String><Key>UserName</Key><Value>madev@work</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">jira pw</Value></String>
+					<String><Key>URL</Key><Value></Value></String>
+					<String><Key>Notes</Key><Value>Ask IT for the recovery codes.</Value></String>
+					<String><Key>TimeOtp-Secret-Base32</Key><Value ProtectInMemory="True">GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ</Value></String>
+					<String><Key>TimeOtp-Length</Key><Value>8</Value></String>
+					<String><Key>TimeOtp-Period</Key><Value>30</Value></String>
+				</Entry>
+				<Entry>
+					<UUID>wksqO+OlXYSjbl/gSWEqPw==</UUID>
+					<Times>
+						<Expires>True</Expires>
+						<ExpiryTime>2020-01-01T00:00:00Z</ExpiryTime>
+					</Times>
+					<String><Key>Title</Key><Value>Expired VPN</Value></String>
+					<String><Key>UserName</Key><Value>vpn</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">old</Value></String>
+				</Entry>
+				<Entry>
+					<UUID>+sIER8MaXy+Dh+/2YkIUNw==</UUID>
+					<String><Key>Title</Key><Value>Kancelária Žilina</Value></String>
+					<String><Key>UserName</Key><Value>recepcia</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">office</Value></String>
+				</Entry>
+			</Group>
+			<Group>
+				<UUID>hAkA3WRfXbGo+1XXYzYAsQ==</UUID>
+				<Name>Homelab</Name>
+				<Entry>
+					<UUID>iWn7uCApUbG6sm9X4eP8dQ==</UUID>
+					<String><Key>Title</Key><Value>Gitea home server</Value></String>
+					<String><Key>UserName</Key><Value>admin</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">admin-pw</Value></String>
+					<String><Key>URL</Key><Value>http://gitea.lan:3000</Value></String>
+				</Entry>
+				<Entry>
+					<UUID>BW2cK7sVUjqvVITzQUlJDw==</UUID>
+					<String><Key>Title</Key><Value>Router</Value></String>
+					<String><Key>UserName</Key><Value>root</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">router-pw</Value></String>
+					<AutoType>
+						<Enabled>False</Enabled>
+						<DataTransferObfuscation>0</DataTransferObfuscation>
+					</AutoType>
+				</Entry>
+			</Group>
+			<Group>
+				<UUID>DCY+slElXIubEZlfe9cZcA==</UUID>
+				<Name>Archive</Name>
+				<EnableSearching>False</EnableSearching>
+				<Entry>
+					<UUID>Wke56nDwUsqqaA31yYBD9g==</UUID>
+					<String><Key>Title</Key><Value>Hidden thing</Value></String>
+					<String><Key>UserName</Key><Value>ghost</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">boo</Value></String>
+				</Entry>
+			</Group>
+			<Group>
+				<UUID>CFIEyIXKUAu7nPmBTRKWHA==</UUID>
+				<Name>Recycle Bin</Name>
+				<EnableAutoType>False</EnableAutoType>
+				<EnableSearching>False</EnableSearching>
+				<Entry>
+					<UUID>uXJdIzhCXqWIjVlDjiJPrg==</UUID>
+					<String><Key>Title</Key><Value>Old GitHub</Value></String>
+					<String><Key>UserName</Key><Value>madev-old</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">deleted</Value></String>
+				</Entry>
+			</Group>
+		</Group>
+	</Root>
+</KeePassFile>

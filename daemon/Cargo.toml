@@ -1,0 +1,45 @@
+[package]
+name = "omakeepickd"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+description = "Helper daemon for the OmaKeePick Omarchy shell plugin: opens a KeePass KDBX database and serves search, copy and auto-type requests"
+license = "MIT"
+authors = ["Miroslav Adamec"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+argon2 = "0.6"
+chacha20poly1305 = "0.11"
+base64 = "0.22"
+chrono = "0.4"
+futures-util = { version = "0.3", default-features = false }
+getrandom = "0.3"
+hmac = "0.12"
+keepass = "0.17"
+libc = "0.2"
+notify = { version = "8", default-features = false }
+nucleo-matcher = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] }
+zeroize = { version = "1", features = ["derive", "serde"] }
+
+[dev-dependencies]
+keepass = { version = "0.17", features = ["save_kdbx4"] }
+rust_argon2 = { package = "rust-argon2", version = "3" }
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Key derivation (Argon2/AES-KDF) is unbearably slow without optimisations, even in tests.
+[profile.dev.package."*"]
+opt-level = 3
