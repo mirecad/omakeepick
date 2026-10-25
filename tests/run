@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Every check the QML side of this plugin ships. Run from anywhere.
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+shell_dir="${OMARCHY_PATH:-/usr/share/omarchy}/shell"
+qmllint="${QMLLINT:-/usr/lib/qt6/bin/qmllint}"
+
+echo "== manifest =="
+omarchy plugin validate "$root"
+echo "ok"
+
+echo "== model =="
+node --test "$root/tests"/*.test.js
+
+echo "== qml =="
+# Inside Quickshell `qs.*` resolves against the shell directory. Give qmllint
+# the same view through a throwaway `qs` link, kept outside the plugin folder
+# because plugins may not contain symlinks.
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+ln -s "$shell_dir" "$scratch/qs"
+"$qmllint" -I "$scratch" --json "$scratch/lint.json" "$root"/*.qml >/dev/null 2>&1 || true
+[[ -s $scratch/lint.json ]] || { echo "FAIL: qmllint produced no report"; exit 1; }
+node "$root/tests/lint.js" "$scratch/lint.json"
+
+echo "== daemon =="
+cargo="$(command -v cargo || echo "$HOME/.cargo/bin/cargo")"
+if [[ -x $cargo ]]; then
+  (cd "$root/daemon" && "$cargo" test --quiet)
+else
+  echo "skipped: cargo not found"
+fi
