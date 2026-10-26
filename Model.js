@@ -484,12 +484,17 @@ function isTypingKey(text, modifiers) {
 // The search card's key map. Text editing (Backspace, Ctrl+Backspace,
 // Ctrl+U) is Commons.Util's and is checked before this; anything unmapped
 // returns "" so the caller leaves the event alone.
+//
+// Plain Enter only copies: typing into whatever window is underneath takes a
+// deliberate Ctrl chord. Shift alone does not change Enter, since it is often
+// still down from a capital at the end of the query.
 function searchCommand(key, modifiers, text) {
   var mods = plainModifiers(modifiers)
   if (key === KEYS.Escape) return "escape"
   if (key === KEYS.Return || key === KEYS.Enter) {
-    if (mods === MODS.Control) return "typePassword"
-    if ((mods & ~MODS.Shift) === 0) return "autotype"
+    if (mods === MODS.Control) return "autotype"
+    if (mods === (MODS.Control | MODS.Shift)) return "typePassword"
+    if ((mods & ~MODS.Shift) === 0) return "copyPassword"
     return ""
   }
   if (mods === MODS.Control) {
@@ -509,6 +514,23 @@ function searchCommand(key, modifiers, text) {
   }
   if (isTypingKey(text, modifiers)) return "type"
   return ""
+}
+
+// The search card's footer, one array per line. Ctrl+C is left out: Enter
+// does the same.
+function searchHints() {
+  return [
+    [
+      { keys: "Enter", label: "copy password", action: "copyPassword" },
+      { keys: "Ctrl+Enter", label: "auto-type", action: "autotype" },
+      { keys: "Ctrl+Shift+Enter", label: "type password", action: "typePassword" }
+    ],
+    [
+      { keys: "Ctrl+B", label: "copy username", action: "copyUsername" },
+      { keys: "Ctrl+T", label: "copy TOTP", action: "copyTotp" },
+      { keys: "Ctrl+L", label: "copy URL", action: "copyUrl" }
+    ]
+  ]
 }
 
 // The unlock and PIN cards' key map, read off the focused field.
@@ -590,6 +612,7 @@ if (typeof module !== "undefined" && module.exports) {
     publicStatus: publicStatus,
     isTypingKey: isTypingKey,
     searchCommand: searchCommand,
+    searchHints: searchHints,
     formCommand: formCommand,
     moveSelection: moveSelection
   }

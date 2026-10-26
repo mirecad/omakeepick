@@ -8,7 +8,8 @@ import qs.Ui
 import "Model.js" as Model
 
 // The picker overlay. One card, three faces:
-//   search  -- the database is open: type, pick a row, Enter auto-types it
+//   search  -- the database is open: type, pick a row, Enter copies its
+//              password; the footer lists the other keys
 //   unlock  -- database + key file + master password (+ optional PIN)
 //   pin     -- the database was locked with a quick-unlock PIN on file
 // plus a fourth, "offline", while omakeepickd is not reachable.
@@ -91,11 +92,18 @@ Item {
   property int maxVisibleRows: 8
   property int cardWidth: Math.min(Style.space(640), panel.width - Style.gapsOut * 2)
 
+  // Footer lines get a fixed height from the font, not from the laid-out
+  // text, which a hidden card would report as zero.
+  readonly property var hintLines: Model.searchHints()
+  readonly property int hintLineHeight: Math.ceil(hintMetrics.height)
+  readonly property int hintLineSpacing: Style.space(2)
+  readonly property int hintsHeight: hintLines.length * hintLineHeight + (hintLines.length - 1) * hintLineSpacing
+
   readonly property int visibleRows: Math.min(displayModel.count, maxVisibleRows)
   readonly property int listHeight: visibleRows > 0 ? visibleRows * rowHeight + (visibleRows - 1) * rowSpacing : 0
-  readonly property int fullSearchHeight: contentMargin * 2 + headerHeight + contentSpacing + maxVisibleRows * rowHeight + (maxVisibleRows - 1) * rowSpacing
+  readonly property int fullSearchHeight: contentMargin * 2 + headerHeight + contentSpacing + maxVisibleRows * rowHeight + (maxVisibleRows - 1) * rowSpacing + contentSpacing + hintsHeight
   readonly property int cardHeight: {
-    if (view === "search") return contentMargin * 2 + headerHeight + (visibleRows > 0 ? contentSpacing + listHeight : 0)
+    if (view === "search") return contentMargin * 2 + headerHeight + (visibleRows > 0 ? contentSpacing + listHeight + contentSpacing + hintsHeight : 0)
     if (view === "pin") return contentMargin * 2 + pinColumn.implicitHeight
     if (view === "unlock") return contentMargin * 2 + unlockColumn.implicitHeight
     return contentMargin * 2 + offlineColumn.implicitHeight
@@ -424,6 +432,13 @@ Item {
 
   ListModel { id: displayModel }
 
+  FontMetrics {
+    id: hintMetrics
+    font.family: root.fontFamily
+    font.pixelSize: Style.font.caption
+    font.bold: true
+  }
+
   PointerMoveGate {
     id: pointerGate
     referenceItem: card
@@ -621,7 +636,7 @@ Item {
                   root.cursorActive = true
                   root.selectedIndex = row.index
                 }
-                onDoubleClicked: root.runAction(row.index, "autotype")
+                onDoubleClicked: root.runAction(row.index, "copyPassword")
               }
             }
           }
@@ -655,6 +670,58 @@ Item {
             gradient: Gradient {
               GradientStop { position: 0; color: Util.alpha(root.background, 0) }
               GradientStop { position: 1; color: root.background }
+            }
+          }
+        }
+
+        // What the keys do, for whoever opens this the first time. Lined up
+        // with the row titles above.
+        Column {
+          width: parent.width
+          visible: root.visibleRows > 0
+          leftPadding: root.rowReservedBorderLeft + Style.space(18)
+          spacing: root.hintLineSpacing
+
+          Repeater {
+            model: root.hintLines
+
+            delegate: Row {
+              id: hintLine
+              required property var modelData
+
+              height: root.hintLineHeight
+              spacing: Style.space(16)
+
+              Repeater {
+                model: hintLine.modelData
+
+                delegate: Row {
+                  id: hint
+                  required property var modelData
+
+                  anchors.verticalCenter: parent.verticalCenter
+                  spacing: Style.space(5)
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: hint.modelData.keys
+                    color: root.foreground
+                    opacity: 0.72
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: hint.modelData.label
+                    color: root.foreground
+                    opacity: 0.45
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
             }
           }
         }

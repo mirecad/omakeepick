@@ -38,10 +38,13 @@ test("Qt key and modifier values match Qt's enums", () => {
 
 test("search keys map to the documented actions", () => {
   const c = (key, mods = 0, text = "") => Model.searchCommand(key, mods, text)
-  assert.equal(c(KEYS.Return), "autotype")
-  assert.equal(c(KEYS.Enter, MODS.Keypad), "autotype")
-  assert.equal(c(KEYS.Return, MODS.Control), "typePassword")
-  assert.equal(c(KEYS.Enter, MODS.Control | MODS.Keypad), "typePassword")
+  assert.equal(c(KEYS.Return), "copyPassword")
+  assert.equal(c(KEYS.Enter, MODS.Keypad), "copyPassword")
+  assert.equal(c(KEYS.Return, MODS.Shift), "copyPassword", "a Shift left down from a capital")
+  assert.equal(c(KEYS.Return, MODS.Control), "autotype")
+  assert.equal(c(KEYS.Enter, MODS.Control | MODS.Keypad), "autotype")
+  assert.equal(c(KEYS.Return, MODS.Control | MODS.Shift), "typePassword")
+  assert.equal(c(KEYS.Enter, MODS.Control | MODS.Shift | MODS.Keypad), "typePassword")
   assert.equal(c(KEYS.B, MODS.Control, "\x02"), "copyUsername")
   assert.equal(c(KEYS.C, MODS.Control, "\x03"), "copyPassword")
   assert.equal(c(KEYS.T, MODS.Control, "\x14"), "copyTotp")
@@ -53,6 +56,21 @@ test("search keys map to the documented actions", () => {
   assert.equal(c(KEYS.PageDown), "pageDown")
   assert.equal(c(KEYS.Home), "home")
   assert.equal(c(KEYS.End), "end")
+})
+
+test("the search card's footer tells the truth about the key map", () => {
+  const lines = Model.searchHints()
+  assert.equal(lines[0][0].keys, "Enter")
+  assert.equal(lines[0][0].action, "copyPassword")
+  for (const hint of lines.flat()) {
+    const parts = hint.keys.split("+")
+    const name = parts.pop()
+    const mods = parts.reduce((m, p) => m | { Ctrl: MODS.Control, Shift: MODS.Shift }[p], 0)
+    const key = name === "Enter" ? KEYS.Return : KEYS[name]
+    assert.ok(key, `unknown key in "${hint.keys}"`)
+    assert.equal(Model.searchCommand(key, mods, ""), hint.action, hint.keys)
+    assert.ok(Model.isCopyAction(hint.action) || Model.isTypeAction(hint.action), hint.action)
+  }
 })
 
 test("plain and shifted characters type into the query; shortcuts do not", () => {

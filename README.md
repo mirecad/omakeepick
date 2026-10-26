@@ -1,8 +1,9 @@
 # OmaKeePick
 
 A Listary-style KeePass picker for [Omarchy](https://omarchy.org). Press a key anywhere, type a
-few letters of an entry, and press Enter: OmaKeePick types the username, Tab and password into
-the window you were in. A padlock in the bar shows whether the database is unlocked.
+few letters of an entry, and press Enter to copy its password, or Ctrl+Enter to have OmaKeePick
+type the username, Tab and password into the window you were in. A padlock in the bar shows
+whether the database is unlocked.
 
 - **One search box** in the middle of the screen. Fuzzy full-text search over title, username,
   URL, group path, tags and notes. It ignores case and diacritics (`zilina` finds `Žilina`) and
@@ -58,12 +59,16 @@ The first time, the picker shows an unlock card:
 
 Enter unlocks, and Tab moves between the fields. Both paths are remembered for next time.
 
+Once the database is open, the picker searches it. The main keys are listed at the bottom of
+the picker:
+
 | Key | Action |
 |---|---|
 | typing | search |
 | ↑ ↓ PgUp PgDn Home End | move the selection |
-| **Enter** | auto-type the entry into the previously focused window |
-| **Ctrl+Enter** | type only the password |
+| **Enter** | copy the password (so does a double click) |
+| **Ctrl+Enter** | auto-type the entry into the previously focused window |
+| **Ctrl+Shift+Enter** | type only the password |
 | **Ctrl+B** | copy the username |
 | **Ctrl+C** | copy the password |
 | **Ctrl+T** | copy the current TOTP code |
