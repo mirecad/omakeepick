@@ -120,7 +120,8 @@ Item {
     root.clearSecrets()
 
     // `{"unlock":true,"db":"/path"}` opens the unlock card on that file, even
-    // over an unlocked database (the bar panel's "Open database…").
+    // over an unlocked database (the bar panel's "Open database…"), and
+    // `"error"` shows why its file dialog failed.
     var requestedDb = typeof payload.db === "string" ? payload.db : ""
     root.unlockRequested = payload.unlock === true || requestedDb !== ""
     if (requestedDb !== "") {
@@ -131,6 +132,8 @@ Item {
       root.draftPicked = false
       root.prefillDrafts()
     }
+    // After the view settled: a view change clears the error.
+    if (typeof payload.error === "string") root.unlockError = payload.error
 
     pointerGate.reset()
     root.opened = true

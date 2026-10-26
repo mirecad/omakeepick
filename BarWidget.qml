@@ -53,7 +53,13 @@ Panel {
           keyfile: reply.keyfile ? String(reply.keyfile) : ""
         }))
       }
-      else if (reply.error !== "cancelled") target.notify("OmaKeePick", Model.errorText(reply), "normal")
+      else if (reply.error !== "cancelled") {
+        // Not just a notification, which Do Not Disturb would swallow: the
+        // card shows the error where Ctrl+O tries again.
+        var message = Model.errorText(reply)
+        if (!target.openPicker(JSON.stringify({ unlock: true, error: message })))
+          target.notify("OmaKeePick", message, "normal")
+      }
     })
   }
 

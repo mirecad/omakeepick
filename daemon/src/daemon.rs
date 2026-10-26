@@ -643,7 +643,9 @@ impl Daemon {
     }
 
     async fn pick_file(self: &Arc<Self>, a: PickArgs) -> Reply {
-        let (title, filters, folder) = {
+        let kind = portal::FileKind::parse(&a.kind)
+            .ok_or_else(|| ApiError::bad_request(format!("Unknown file kind {}", a.kind)))?;
+        let folder = {
             let core = self.core();
             let current = core
                 .open
@@ -655,30 +657,22 @@ impl Daemon {
                     let keyfile = core.store.keyfile_for(&last);
                     (last, keyfile)
                 });
-            match a.kind.as_str() {
-                "db" => (
-                    "Open KeePass database",
-                    portal::Filters::Database,
-                    current.0.parent().map(Path::to_path_buf),
-                ),
-                "keyfile" => (
-                    "Choose key file",
-                    portal::Filters::KeyFile,
-                    current
-                        .1
-                        .as_deref()
-                        .or(Some(current.0.as_path()))
-                        .and_then(Path::parent)
-                        .map(Path::to_path_buf),
-                ),
-                other => return Err(ApiError::bad_request(format!("Unknown file kind {other}"))),
+            match kind {
+                portal::FileKind::Database => current.0.parent().map(Path::to_path_buf),
+                portal::FileKind::KeyFile => current
+                    .1
+                    .as_deref()
+                    .or(Some(current.0.as_path()))
+                    .and_then(Path::parent)
+                    .map(Path::to_path_buf),
             }
         };
-        let path = portal::open_file(title, filters, folder.as_deref())
+        let path = portal::choose_file(kind, folder.as_deref())
             .await
             .map_err(|e| ApiError::new("failed", e))?
             .ok_or_else(|| ApiError::new("cancelled", "No file chosen"))?;
-        let keyfile = (a.kind == "db").then(|| self.core().store.keyfile_for(&path)).flatten();
+        let keyfile =
+            (kind == portal::FileKind::Database).then(|| self.core().store.keyfile_for(&path)).flatten();
         ok_with(json!({"path": path, "keyfile": keyfile}))
     }
 
