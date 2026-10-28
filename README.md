@@ -157,6 +157,8 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
 - **Not stored anywhere:** passwords or PINs. `~/.local/state/omakeepick/state.json` holds
   only the last database and key-file paths, plus per-entry use counts (by UUID) for ranking.
 
+Found a vulnerability? Please report it privately, as described in [SECURITY.md](SECURITY.md).
+
 ## Limitations
 
 - KDBX 3.1 and 4.x with a password and/or a key file are supported (XML v1/v2, 32/64-byte and
@@ -180,10 +182,13 @@ password is `test-password`.
 
 **Releasing:**
 
-1. Bump `version` in both `manifest.json` and `daemon/Cargo.toml`.
-2. Commit.
-3. Push the tag `vX.Y.Z`. The release workflow attaches `omakeepickd-x86_64-linux` and its
-   `.sha256`.
+1. Bump `version` in both `manifest.json` and `daemon/Cargo.toml`, then run `cargo check` in
+   `daemon/` so `Cargo.lock` follows. The workflows build with `--locked`.
+2. Commit, and tag the commit `vX.Y.Z`.
+3. Push only the tag: `git push origin vX.Y.Z`. The release workflow attaches
+   `omakeepickd-x86_64-linux` and its `.sha256`.
+4. Once the release is published, push `main`. `omarchy plugin update` follows `main`, and a
+   plugin whose version has no release yet builds the daemon from source instead.
 
 ## License
 
