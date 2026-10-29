@@ -35,7 +35,7 @@ pub async fn idle_loop(daemon: Arc<Daemon>) {
 )]
 trait Manager {
     fn inhibit(&self, what: &str, who: &str, why: &str, mode: &str) -> zbus::Result<OwnedFd>;
-    fn get_session_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
+    fn get_session(&self, session_id: &str) -> zbus::Result<OwnedObjectPath>;
     #[zbus(signal)]
     fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
 }
@@ -70,7 +70,10 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
         let conn = conn.clone();
         let manager = manager.clone();
         async move {
-            let path = manager.get_session_by_pid(std::process::id()).await?;
+            // Not by PID: under uwsm the shell, and so this daemon, runs in a user service
+            // outside the login session's scope. `auto` is the caller's session if it has one,
+            // else the user's graphical session.
+            let path = manager.get_session("auto").await?;
             let session = SessionProxy::builder(&conn).path(path).build().await?;
             let mut locks = session.receive_lock().await?;
             while locks.next().await.is_some() {
@@ -80,7 +83,7 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
         }
     };
     tokio::spawn(async move {
-        // The daemon may run outside any logind session (e.g. started over SSH); that's fine.
+        // A user without a graphical session (e.g. only logged in over SSH) has none; that's fine.
         if let Err(e) = session_locks.await {
             eprintln!("omakeepickd: not watching logind session lock: {e}");
         }
