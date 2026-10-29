@@ -20,6 +20,15 @@ https://github.com/user-attachments/assets/d7c362f3-6354-4d96-acbe-30396dc28392
 - **Read-only.** OmaKeePick never writes to your database. Keep using KeePassXC (or anything
   else) to edit it, and the picker reloads the file when it changes.
 
+## Requirements
+
+- Omarchy 4.
+- `wtype` for auto-type and `wl-clipboard` for copying. Both ship with Omarchy.
+- `curl`, to download the prebuilt helper (x86_64 only). Elsewhere, or with
+  `bin/install --source`, the helper is built from source, which needs Rust
+  (`omarchy pkg add rust`).
+- A KeePass database in KDBX 3.1 or 4.x format. KeePassXC itself is not needed.
+
 ## Install
 
 ```bash
@@ -28,8 +37,8 @@ omarchy plugin add https://github.com/mirecad/omakeepick.git --enable
 
 On first start the plugin installs its helper, `omakeepickd`. It downloads the prebuilt binary
 from this repository's releases and checks it against the SHA-256 pinned in
-`bin/omakeepickd.sha256`. If it can't, it builds the helper from source, which needs Rust
-(`omarchy pkg add rust`). To run the installer yourself:
+`bin/omakeepickd.sha256`. If it can't, it builds the helper from source. To run the installer
+yourself:
 
 ```bash
 ~/.config/omarchy/plugins/mirecad.omakeepick/bin/install            # download, or build
@@ -49,7 +58,17 @@ Optionally, to make the picker pop up without a fade, like the stock pickers, ad
 hl.layer_rule({ match = { namespace = "^omakeepick$" }, no_anim = true, animation = "none" })
 ```
 
-Auto-type uses `wtype`, and the clipboard uses `wl-clipboard`. Both ship with Omarchy.
+## Remove
+
+```bash
+omarchy plugin remove mirecad.omakeepick
+pkill -x omakeepickd   # stop the helper; it locks and wipes the database first
+```
+
+Then delete the `SUPER + SHIFT + K` binding and the `omakeepick` layer rule, if you added them.
+OmaKeePick never writes to your database, so there is nothing else to undo. To also forget the
+last database path and the usage counts, delete `~/.local/state/omakeepick`. A helper built from
+source leaves a build cache in `~/.cache/omakeepick`.
 
 ## Use
 

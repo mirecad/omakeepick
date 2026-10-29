@@ -21,7 +21,7 @@ omarchy plugin validate "$root" >/dev/null
 # feed the shell's recursive file watcher.
 mkdir -p "$dest/bin"
 git -C "$root" ls-files --cached --others --exclude-standard -z -- \
-  ':!daemon' ':!.github' ':!docs' |
+  ':!daemon' ':!.github' ':!docs' ':!preview.png' |
   while IFS= read -r -d '' file; do
     install -D -m "$( [[ -x $root/$file ]] && echo 0755 || echo 0644 )" "$root/$file" "$dest/$file"
   done
