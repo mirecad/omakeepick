@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Installs omakeepickd, the plugin's helper daemon, as bin/omakeepickd next to this script.
 #
-#   bin/install           download the release binary for this plugin version and verify its
-#                         SHA-256; build from source with cargo if that is not possible
+#   bin/install           download the release binary for this plugin version and check it
+#                         against the SHA-256 pinned in bin/omakeepickd.sha256; build from
+#                         source with cargo if that is not possible
 #   bin/install --source  always build from source (needs rust: omarchy pkg add rust)
 #
 # The shell plugin runs this by itself when the binary is missing or older than the plugin.
@@ -14,6 +15,9 @@ repo="${OMAKEEPICK_REPO:-mirecad/omakeepick}"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 version="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$root/manifest.json" | head -1)"
 target="$root/bin/omakeepickd"
+# "<version> <sha256>" of the release binary this commit installs. Committed after each
+# release, so a reviewed commit pins the exact binary, not just whatever the release holds.
+pin="$root/bin/omakeepickd.sha256"
 cache="${XDG_CACHE_HOME:-$HOME/.cache}/omakeepick"
 asset="omakeepickd-x86_64-linux"
 
@@ -27,12 +31,17 @@ trap 'rm -rf "$work"' EXIT
 download() {
   [[ $(uname -m) == x86_64 ]] || { say "no prebuilt binary for $(uname -m)"; return 1; }
   command -v curl >/dev/null || { say "curl is not installed"; return 1; }
+  local pinned_version="" pinned_sha=""
+  [[ -r $pin ]] && read -r pinned_version pinned_sha <"$pin" || true
+  if [[ $pinned_version != "$version" || ! $pinned_sha =~ ^[0-9a-f]{64}$ ]]; then
+    say "no binary pinned for $version in bin/omakeepickd.sha256"
+    return 1
+  fi
   local base="https://github.com/$repo/releases/download/v$version"
   say "downloading $asset $version from github.com/$repo"
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset" "$base/$asset" &&
-    curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset.sha256" "$base/$asset.sha256" ||
+  curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset" "$base/$asset" ||
     { say "download failed"; return 1; }
-  if ! (cd "$work" && sha256sum --check --status "$asset.sha256"); then
+  if [[ $(sha256sum "$work/$asset" | cut -d' ' -f1) != "$pinned_sha" ]]; then
     say "checksum mismatch, refusing the download"
     return 1
   fi

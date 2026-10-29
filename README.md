@@ -27,8 +27,9 @@ omarchy plugin add https://github.com/mirecad/omakeepick.git --enable
 ```
 
 On first start the plugin installs its helper, `omakeepickd`. It downloads the prebuilt binary
-from this repository's releases and checks its SHA-256. If it can't, it builds the helper from
-source, which needs Rust (`omarchy pkg add rust`). To run the installer yourself:
+from this repository's releases and checks it against the SHA-256 pinned in
+`bin/omakeepickd.sha256`. If it can't, it builds the helper from source, which needs Rust
+(`omarchy pkg add rust`). To run the installer yourself:
 
 ```bash
 ~/.config/omarchy/plugins/mirecad.omakeepick/bin/install            # download, or build
@@ -151,6 +152,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     can't `ptrace` it or read its memory.
   - Its memory is not pinned, so while unlocked the kernel may swap it. Locking, including the
     automatic lock before suspend or hibernate, wipes the decrypted database first.
+- **The prebuilt helper is pinned.** Each commit of the plugin names the SHA-256 of the one
+  release binary it installs (`bin/omakeepickd.sha256`), so a release file swapped later is
+  refused. From 0.1.1 on, release binaries also carry a GitHub build attestation, and
+  `gh attestation verify ~/.config/omarchy/plugins/mirecad.omakeepick/bin/omakeepickd -R mirecad/omakeepick`
+  confirms that yours was built by this repository's release workflow. To skip the download
+  entirely, build the helper yourself with `bin/install --source`.
 - **How the PIN works.** With a PIN, the daemon keeps the database credentials in memory,
   encrypted with `ChaCha20-Poly1305` under a key derived from the PIN with `Argon2id`
   (64 MiB). Three wrong PINs, suspend, hibernate, *Close database* or the daemon exiting
@@ -188,9 +195,16 @@ password is `test-password`.
    `daemon/` so `Cargo.lock` follows. The workflows build with `--locked`.
 2. Commit, and tag the commit `vX.Y.Z`.
 3. Push only the tag: `git push origin vX.Y.Z`. The release workflow attaches
-   `omakeepickd-x86_64-linux` and its `.sha256`.
-4. Once the release is published, push `main`. `omarchy plugin update` follows `main`, and a
-   plugin whose version has no release yet builds the daemon from source instead.
+   `omakeepickd-x86_64-linux`, its `.sha256` and a build attestation.
+4. Pin the new binary, and commit:
+
+   ```bash
+   printf '%s %s\n' X.Y.Z "$(gh release download vX.Y.Z -p '*.sha256' -O - | cut -d' ' -f1)" \
+     > bin/omakeepickd.sha256
+   ```
+
+5. Push `main`. `omarchy plugin update` follows `main`, and a plugin whose version has no pinned
+   binary builds the daemon from source instead. CI checks the pin against the release.
 
 ## License
 

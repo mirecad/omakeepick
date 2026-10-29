@@ -9,7 +9,7 @@ jobs:
   daemon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -26,8 +26,8 @@ jobs:
   model:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: node --test tests/*.test.js
@@ -36,3 +36,13 @@ jobs:
           plugin="$(jq -r .version manifest.json)"
           daemon="$(sed -n 's/^version = "\(.*\)"/\1/p' daemon/Cargo.toml | head -1)"
           test "$plugin" = "$daemon" || { echo "manifest.json $plugin != Cargo.toml $daemon"; exit 1; }
+      # main must pin the binary of a published release (the tag goes first, see the README).
+      - name: The pinned helper binary is the released one
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          plugin="$(jq -r .version manifest.json)"
+          read -r pinned sha < bin/omakeepickd.sha256
+          test "$pinned" = "$plugin" || { echo "bin/omakeepickd.sha256 pins $pinned, manifest.json is $plugin"; exit 1; }
+          released="$(gh release download "v$plugin" -R "$GITHUB_REPOSITORY" -p omakeepickd-x86_64-linux.sha256 -O - | cut -d' ' -f1)"
+          test "$sha" = "$released" || { echo "pinned $sha, but release v$plugin has $released"; exit 1; }

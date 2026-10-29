@@ -1,19 +1,24 @@
 name: Release
 
-# Push a tag vX.Y.Z matching manifest.json and daemon/Cargo.toml. The plugin's bin/install
-# downloads the binary attached here and checks it against the .sha256 file.
+# Push a tag vX.Y.Z matching manifest.json and daemon/Cargo.toml, then pin the binary's
+# SHA-256 in bin/omakeepickd.sha256 (see "Releasing" in the README). The plugin's bin/install
+# downloads the binary attached here and checks it against that pin.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: write
+  # Sign and store the build provenance attestation.
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
     runs-on: ubuntu-22.04 # older glibc, so the binary runs on more systems
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag matches the plugin version
         run: |
           plugin="$(jq -r .version manifest.json)"
@@ -28,7 +33,12 @@ jobs:
           mkdir dist
           cp daemon/target/release/omakeepickd dist/omakeepickd-x86_64-linux
           cd dist && sha256sum omakeepickd-x86_64-linux > omakeepickd-x86_64-linux.sha256
-      - uses: softprops/action-gh-release@v2
+      # Lets anyone check that the binary was built here, from this tag:
+      # gh attestation verify omakeepickd-x86_64-linux -R <owner>/<repo>
+      - uses: actions/attest@v4
+        with:
+          subject-path: dist/omakeepickd-x86_64-linux
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/omakeepickd-x86_64-linux
