@@ -161,12 +161,15 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
   process that opens the database. The shell plugin (QML inside your desktop shell) only ever
   sees entry titles, usernames and group names. Passwords, notes and TOTP secrets never reach
   it: the daemon types and copies them itself.
-- **Nothing from your database appears on a command line.** The master password and PIN go
-  from the unlock field straight to the daemon, and the field is cleared. Passwords, usernames
-  and other field values go to `wtype` and `wl-copy` on stdin, never as arguments, so other
-  users can't read them from `/proc/<pid>/cmdline`. For the same reason, notifications never
-  name an entry or quote anything from the database: their text is passed to
+- **Passwords and field values never appear on a command line.** The master password and PIN
+  go from the unlock field straight to the daemon, and the field is cleared. Passwords,
+  usernames and other field values go to `wtype` and `wl-copy` on stdin, never as arguments, so
+  other users can't read them from `/proc/<pid>/cmdline`. For the same reason, notifications
+  never name an entry or quote anything from the database: their text is passed to
   `omarchy-notification-send` as arguments, and Omarchy keeps it in its notification history.
+  The one exception is auto-type's own arguments: key names and the character of a shortcut
+  like `^a`. Both come from the auto-type sequence, which can be saved in the database, so keep
+  secrets in fields, not in a sequence.
 - **The daemon is locked down.**
   - It listens on `$XDG_RUNTIME_DIR/omakeepick/sock`. The socket's directory is mode `0700`,
     and connections from other users are refused (checked with `SO_PEERCRED`).
