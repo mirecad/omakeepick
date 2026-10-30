@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mirecad.omakeepick",
   "name": "OmaKeePick",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "Miroslav Adamec",
   "license": "MIT",
   "description": "A Listary-style KeePass picker: search a KDBX database from anywhere, auto-type or copy credentials, and see the lock state in the bar.",
