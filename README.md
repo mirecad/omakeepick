@@ -5,7 +5,7 @@ few letters of an entry, and press Enter to copy its password, or Ctrl+Enter to 
 type the username, Tab and password into the window you were in. A padlock in the bar shows
 whether the database is unlocked.
 
-https://github.com/user-attachments/assets/d7c362f3-6354-4d96-acbe-30396dc28392
+https://github.com/user-attachments/assets/c206efcd-995d-456a-a263-50292cf0bdac
 
 - **One search box** in the middle of the screen. Fuzzy full-text search over title, username,
   URL, group path, tags and notes. It ignores case and diacritics (`zilina` finds `Žilina`) and
