@@ -36,6 +36,9 @@ Reply (daemon → client):
 {"id": 7, "ok": false, "error": "locked", "message": "Database is locked"}
 ```
 
+A `message` never quotes database contents (entry titles, field values, auto-type sequences),
+so a client may show it in a desktop notification.
+
 Event (daemon → client, unsolicited, no `id`):
 
 ```json

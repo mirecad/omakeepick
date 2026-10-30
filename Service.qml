@@ -170,14 +170,16 @@ Item {
 
   // Runs an entry action and reports the outcome as a desktop notification.
   // Callers hide their surface first; auto-type types into whatever has focus.
+  // The notification never names the entry: its text goes on the command line
+  // of omarchy-notification-send, which other users can read, and Omarchy keeps
+  // it in the notification history.
   function perform(entry, action, callback) {
     if (!entry || !entry.id) return 0
-    var title = String(entry.title || "")
     return request("act", { entry: entry.id, action: action }, function(reply) {
       if (!reply.ok) {
-        if (reply.error !== "cancelled") root.notify(title || "OmaKeePick", Model.errorText(reply), "normal")
+        if (reply.error !== "cancelled") root.notify("OmaKeePick", Model.errorText(reply), "normal")
       } else if (Model.isCopyAction(action) && root.notifyOnCopy) {
-        root.notify(Model.copiedText(action, reply.clearsIn), title, "low")
+        root.notify(Model.copiedText(action, reply.clearsIn), "", "low")
       }
       if (callback) callback(reply)
     }, 0)

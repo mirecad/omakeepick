@@ -72,7 +72,7 @@ pub fn spec(entry: &Entry) -> Result<Option<Spec>, String> {
                 None | Some("HMAC-SHA-1") => Algorithm::Sha1,
                 Some("HMAC-SHA-256") => Algorithm::Sha256,
                 Some("HMAC-SHA-512") => Algorithm::Sha512,
-                Some(other) => return Err(format!("Unsupported TOTP algorithm {other}")),
+                Some(_) => return Err("Unsupported TOTP algorithm".into()),
             };
             return Ok(Some(
                 Spec {
@@ -122,7 +122,7 @@ impl Spec {
 fn parse_num<T: std::str::FromStr>(value: Option<&str>, default: T) -> Result<T, String> {
     match value {
         None => Ok(default),
-        Some(v) => v.trim().parse().map_err(|_| format!("Invalid TOTP setting '{v}'")),
+        Some(v) => v.trim().parse().map_err(|_| "Invalid TOTP settings".to_string()),
     }
 }
 
@@ -130,7 +130,7 @@ fn parse_otp_field(value: &str) -> Result<Spec, String> {
     let query = match value.split_once("://") {
         Some((scheme, rest)) => {
             if !scheme.eq_ignore_ascii_case("otpauth") {
-                return Err(format!("Unsupported OTP URI scheme {scheme}"));
+                return Err("Unsupported OTP URI scheme".into());
             }
             if !rest.get(..5).is_some_and(|kind| kind.eq_ignore_ascii_case("totp/")) {
                 return Err("Only time-based OTP (totp) is supported".into());
@@ -159,7 +159,7 @@ fn parse_otp_field(value: &str) -> Result<Spec, String> {
                     "SHA1" => Algorithm::Sha1,
                     "SHA256" => Algorithm::Sha256,
                     "SHA512" => Algorithm::Sha512,
-                    other => return Err(format!("Unsupported TOTP algorithm {other}")),
+                    _ => return Err("Unsupported TOTP algorithm".into()),
                 }
             }
             "encoder" => spec.steam = val.eq_ignore_ascii_case("steam"),

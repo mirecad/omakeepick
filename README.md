@@ -144,7 +144,8 @@ The syntax is the KeePass/KeePassXC subset that matters for logins:
 - **Keys:** `{TAB}` `{ENTER}` `~` `{SPACE}` `{BS}` `{DEL}` `{UP}`… `{F1}`–`{F16}`. Add a count
   to repeat a key: `{TAB 2}`.
 - **Modifiers:** `+` (Shift), `^` (Ctrl) and `%` (Alt) apply to the next key or character, as
-  in `^a`.
+  in `^a`. They can't apply to a field: `+{PASSWORD}` is refused, because the first character
+  would have to go on `wtype`'s command line.
 - **Timing:** `{DELAY 500}` pauses, and `{DELAY=20}` sets the delay between keystrokes.
 - **Other:** `{CLEARFIELD}`, plus the literal escapes `{+}` `{^}` `{%}` `{~}` `{{}` `{}}`.
 
@@ -160,10 +161,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
   process that opens the database. The shell plugin (QML inside your desktop shell) only ever
   sees entry titles, usernames and group names. Passwords, notes and TOTP secrets never reach
   it: the daemon types and copies them itself.
-- **Passwords never appear on a command line.** The master password and PIN go from the unlock
-  field straight to the daemon, and the field is cleared. Secrets go to `wtype` and `wl-copy`
-  on stdin, never as arguments, so other processes can't read them from
-  `/proc/<pid>/cmdline`.
+- **Nothing from your database appears on a command line.** The master password and PIN go
+  from the unlock field straight to the daemon, and the field is cleared. Passwords, usernames
+  and other field values go to `wtype` and `wl-copy` on stdin, never as arguments, so other
+  users can't read them from `/proc/<pid>/cmdline`. For the same reason, notifications never
+  name an entry or quote anything from the database: their text is passed to
+  `omarchy-notification-send` as arguments, and Omarchy keeps it in its notification history.
 - **The daemon is locked down.**
   - It listens on `$XDG_RUNTIME_DIR/omakeepick/sock`. The socket's directory is mode `0700`,
     and connections from other users are refused (checked with `SO_PEERCRED`).

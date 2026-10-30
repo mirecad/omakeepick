@@ -9,7 +9,9 @@
 //! * `{CLEARFIELD}` (Ctrl+A, Backspace), and literal escapes `{+}` `{^}` `{%}` `{~}` `{{}` `{}}`
 //!   `{(}` `{)}` `{[}` `{]}`
 //!
-//! Secrets are piped to `wtype -` on stdin; they never appear on a command line.
+//! Field values (passwords, usernames, TOTP codes…) are piped to `wtype -` on stdin; they never
+//! appear on a command line. Only key names and the literal characters of chords like `^a`
+//! are passed as arguments.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -45,7 +47,8 @@ pub enum Token {
         mods: Vec<Modifier>,
         repeat: u32,
     },
-    /// A single character typed with modifiers held (`^a`).
+    /// A literal character of the sequence typed with modifiers held (`^a`). Never part of a
+    /// field: a modifier before a field placeholder is rejected.
     Chord {
         text: char,
         mods: Vec<Modifier>,
@@ -180,7 +183,7 @@ pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> 
                     match chars.next() {
                         Some('}') => break,
                         Some(ch) => inner.push(ch),
-                        None => return Err(format!("Unclosed placeholder {{{inner}")),
+                        None => return Err("Unclosed placeholder in auto-type sequence".into()),
                     }
                 }
                 placeholder(&mut b, &inner, fields)?;
@@ -191,6 +194,8 @@ pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> 
     Ok(b.tokens)
 }
 
+// Errors never quote the sequence: it is part of the database, and the message ends up in a
+// desktop notification.
 fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), String> {
     if matches!(inner, "+" | "^" | "%" | "~" | "{" | "(" | ")" | "[" | "]") {
         b.text(inner);
@@ -198,12 +203,12 @@ fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), 
     }
     let upper = inner.to_uppercase();
     if let Some(ms) = upper.strip_prefix("DELAY=") {
-        let ms = ms.trim().parse().map_err(|_| format!("Invalid {{{inner}}}"))?;
+        let ms = ms.trim().parse().map_err(|_| "Invalid {DELAY=…} in auto-type sequence".to_string())?;
         b.plain(Token::SetKeyDelay(ms));
         return Ok(());
     }
     if let Some(ms) = upper.strip_prefix("DELAY ") {
-        let ms = ms.trim().parse().map_err(|_| format!("Invalid {{{inner}}}"))?;
+        let ms = ms.trim().parse().map_err(|_| "Invalid {DELAY …} in auto-type sequence".to_string())?;
         b.plain(Token::Delay(ms));
         return Ok(());
     }
@@ -217,9 +222,10 @@ fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), 
         return Ok(());
     }
     let (name, repeat) = match upper.rsplit_once(' ') {
-        Some((name, count)) if count.chars().all(|c| c.is_ascii_digit()) => {
-            (name.to_string(), count.parse::<u32>().map_err(|_| format!("Invalid {{{inner}}}"))?)
-        }
+        Some((name, count)) if count.chars().all(|c| c.is_ascii_digit()) => (
+            name.to_string(),
+            count.parse::<u32>().map_err(|_| "Invalid key repeat in auto-type sequence".to_string())?,
+        ),
         _ => (upper.clone(), 1),
     };
     if let Some(key) = key_name(&name) {
@@ -230,8 +236,14 @@ fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), 
     let field_name = match upper.as_str() {
         "USERNAME" | "PASSWORD" | "TITLE" | "URL" | "NOTES" | "TOTP" => upper.clone(),
         _ if upper.starts_with("S:") => format!("S:{}", &inner[2..]),
-        _ => return Err(format!("Unsupported auto-type placeholder {{{inner}}}")),
+        _ => return Err("Unsupported placeholder in auto-type sequence".into()),
     };
+    // A modifier would turn the field's first character into a chord, and chords are typed
+    // with the character as a wtype argument, readable by other users. wtype drops keys sent on
+    // stdin while a modifier is held, so there is no safe way to type it.
+    if !b.mods.is_empty() {
+        return Err("Modifiers before a field are not supported in auto-type sequences".into());
+    }
     match fields.field(&field_name)? {
         Some(value) => b.text(&value),
         None => b.mods.clear(),
@@ -435,6 +447,16 @@ mod tests {
         assert!(parse("{PICKCHARS}", &fields()).unwrap_err().contains("Unsupported"));
         assert!(parse("{USERNAME", &fields()).is_err());
         assert!(parse("{DELAY x}", &fields()).is_err());
+    }
+
+    #[test]
+    fn modifiers_before_fields_are_refused() {
+        for sequence in ["+{PASSWORD}", "^{USERNAME}{TAB}", "%{S:PIN}", "{TAB}+{TOTP}"] {
+            let err = parse(sequence, &fields()).unwrap_err();
+            assert!(err.contains("Modifiers before a field"), "{sequence}: {err}");
+        }
+        // Modifiers on keys and literal characters still work.
+        assert!(parse("^a+{TAB}{PASSWORD}", &fields()).is_ok());
     }
 
     #[derive(Default)]
