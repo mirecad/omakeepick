@@ -104,7 +104,8 @@ A lock always wins over an unlock that is still running. If `lock`, `close` or a
 lock (idle, screen lock, suspend) arrives while an `unlock` or `quickUnlock` is in progress, the
 unlock's result is discarded when it completes and the request fails with `cancelled`; the
 state stays as the lock left it. A quick unlock cancelled by a lock that keeps the PIN (manual,
-idle, screen) keeps it; one cancelled by suspend or `close` loses it.
+idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether the PIN was right
+(`cancelled`) or wrong (`no_quick_unlock`).
 
 ### Entry (search result)
 

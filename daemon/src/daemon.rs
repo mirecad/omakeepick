@@ -71,6 +71,9 @@ pub struct Core {
     /// Bumped by every lock. An unlock captures it when it starts and its result is installed
     /// only if it is unchanged, so a lock, close or suspend during an unlock always wins.
     epoch: u64,
+    /// The epoch of the last lock that wiped quick unlock. A quick unlock that started before
+    /// it must not put its PIN key back.
+    wiped_at: u64,
     lock_reason: Option<LockReason>,
     last_activity: Instant,
     store: Store,
@@ -143,6 +146,9 @@ impl Core {
     fn lock(&mut self, reason: LockReason) -> bool {
         self.watcher = None;
         self.epoch += 1;
+        if reason.wipes_quick_unlock() {
+            self.wiped_at = self.epoch;
+        }
         let interrupted = self.busy;
         let changed = if let Some(open) = self.open.take() {
             let OpenDb { path, keyfile, quick, .. } = open;
@@ -167,6 +173,21 @@ impl Core {
 
     fn touch(&mut self) {
         self.last_activity = Instant::now();
+    }
+
+    /// Puts the PIN key a quick unlock took back, unless a lock since `epoch` wiped quick
+    /// unlock (suspend, close) or there is no locked database left to hold it.
+    fn restore_quick(&mut self, blob: QuickBlob, epoch: u64) -> bool {
+        if self.wiped_at > epoch {
+            return false;
+        }
+        match self.locked.as_mut() {
+            Some(locked) => {
+                locked.quick = Some(blob);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -265,6 +286,7 @@ impl Daemon {
                 locked: None,
                 busy: false,
                 epoch: 0,
+                wiped_at: 0,
                 lock_reason: None,
                 last_activity: Instant::now(),
                 store: Store::load(state_dir),
@@ -532,8 +554,12 @@ impl Daemon {
         self.emit_state();
         let p = path.clone();
         let outcome = tokio::task::spawn_blocking(move || {
+            // Read first, check the PIN second: a read error is reported only for a right PIN,
+            // and a wrong one costs a try either way.
+            let data = vault::read_database(&p);
             let key = blob.open(&a.pin, p.as_os_str().as_bytes());
-            let opened = key.map(|key| vault::open_database(&p, &key).map(|db| (key, db)));
+            let opened =
+                key.map(|key| data.and_then(|data| vault::parse_database(&data, &key)).map(|db| (key, db)));
             (blob, opened)
         })
         .await;
@@ -553,9 +579,8 @@ impl Daemon {
                     // back; sleep and close have wiped it.
                     let OpenDb { quick, .. } = rejected;
                     let mut core = self.core();
-                    let keep = !core.lock_reason.is_some_and(LockReason::wipes_quick_unlock);
-                    if let Some(locked) = core.locked.as_mut().filter(|_| keep) {
-                        locked.quick = quick;
+                    if let Some(blob) = quick {
+                        core.restore_quick(blob, epoch);
                     }
                     drop(core);
                     self.emit_state();
@@ -576,12 +601,13 @@ impl Daemon {
                 let left = blob.attempts_left();
                 let mut core = self.core();
                 core.busy = false;
-                if left > 0 {
-                    if let Some(locked) = core.locked.as_mut() {
-                        locked.quick = Some(blob);
-                    }
-                } else {
+                if left == 0 {
                     core.lock_reason = Some(LockReason::Pin);
+                } else if !core.restore_quick(blob, epoch) {
+                    // Suspended or closed while the PIN was being checked: the key is gone.
+                    drop(core);
+                    self.emit_state();
+                    return Err(ApiError::new("no_quick_unlock", "Quick unlock is no longer available"));
                 }
                 drop(core);
                 self.emit_state();

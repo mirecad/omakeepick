@@ -297,23 +297,40 @@ fn a_lock_during_an_unlock_wins() {
     assert_eq!(state["quickUnlock"], false);
     assert_eq!(conn.request("search", json!({"query": "git"}))["error"], "locked");
 
-    // Quick unlock cancelled by a screen lock keeps the PIN; cancelled by suspend, loses it.
-    point_at(&real);
-    assert_eq!(unlock(&mut conn, &db, Some("2468"))["ok"], true);
-    assert_eq!(conn.request("lock", json!({}))["ok"], true);
-    for (reason, keeps_pin) in [("screen", true), ("sleep", false)] {
+    // A quick unlock, right PIN or wrong, cancelled by a screen lock keeps the PIN key;
+    // cancelled by suspend, it loses it.
+    // A wrong PIN still costs a try, and a right one still resets them.
+    for (reason, pin, expect, keeps_pin, attempts) in [
+        ("screen", "0000", "bad_pin", true, 2),
+        ("screen", "2468", "cancelled", true, 3),
+        ("sleep", "0000", "no_quick_unlock", false, 0),
+        ("sleep", "2468", "cancelled", false, 0),
+    ] {
+        let what = format!("{reason} with PIN {pin}");
+        if conn.state()["quickUnlock"] != true {
+            point_at(&real);
+            assert_eq!(unlock(&mut conn, &db, Some("2468"))["ok"], true, "{what}");
+            assert_eq!(conn.request("lock", json!({}))["ok"], true, "{what}");
+        }
         point_at(&fifo);
-        let id = start(&mut conn, "quickUnlock", json!({"pin": "2468"}));
-        assert_eq!(conn.request("lock", json!({"reason": reason}))["ok"], true);
+        let id = start(&mut conn, "quickUnlock", json!({"pin": pin}));
+        assert_eq!(conn.request("lock", json!({"reason": reason}))["ok"], true, "{what}");
         feed();
-        assert_eq!(conn.reply(id)["error"], "cancelled", "{reason}");
+        assert_eq!(conn.reply(id)["error"], expect, "{what}");
         let state = conn.state();
-        assert_eq!(state["phase"], "locked", "{reason}");
-        assert_eq!(state["busy"], false, "{reason}");
-        assert_eq!(state["quickUnlock"], keeps_pin, "{reason}");
-        assert_eq!(state["lockReason"], reason);
+        assert_eq!(state["phase"], "locked", "{what}");
+        assert_eq!(state["busy"], false, "{what}");
+        assert_eq!(state["quickUnlock"], keeps_pin, "{what}");
+        assert_eq!(state["pinAttemptsLeft"], attempts, "{what}");
+        assert_eq!(state["lockReason"], reason, "{what}");
+        if !keeps_pin {
+            assert_eq!(
+                conn.request("quickUnlock", json!({"pin": "2468"}))["error"],
+                "no_quick_unlock",
+                "{what}"
+            );
+        }
     }
-    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["error"], "no_quick_unlock");
 
     // Close during a full unlock: nothing is left to reopen.
     let id = start(&mut conn, "unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));

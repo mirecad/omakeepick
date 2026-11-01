@@ -140,11 +140,20 @@ pub fn read_keyfile(path: &Path) -> Result<Zeroizing<Vec<u8>>, VaultError> {
 
 /// Decrypts the database at `path`. Runs the KDF, so call it from a blocking thread.
 pub fn open_database(path: &Path, key: &KeyMaterial) -> Result<Database, VaultError> {
-    let data = read_file(path).map_err(|e| match e.kind() {
+    parse_database(&read_database(path)?, key)
+}
+
+/// The raw database file; `parse_database` decrypts it.
+pub fn read_database(path: &Path) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    read_file(path).map_err(|e| match e.kind() {
         ErrorKind::NotFound => VaultError::NotFound(path.to_path_buf()),
         _ => VaultError::Io(format!("Cannot read {}: {e}", path.display())),
-    })?;
-    Database::parse(&data, key.database_key()?).map_err(map_open_error)
+    })
+}
+
+/// Runs the KDF, so call it from a blocking thread.
+pub fn parse_database(data: &[u8], key: &KeyMaterial) -> Result<Database, VaultError> {
+    Database::parse(data, key.database_key()?).map_err(map_open_error)
 }
 
 /// Searchable, secret-free view of one entry.
