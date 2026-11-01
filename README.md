@@ -117,7 +117,9 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
 - After 3 wrong PINs, after suspend or hibernate, or after *Close database*, the PIN no longer
   works and you need the master password.
 - A lock always wins. If the screen locks or the machine suspends while an unlock is still
-  running, that unlock is discarded and the database stays locked.
+  running, that unlock is discarded and the database stays locked. Auto-type in progress stops,
+  and a value copied at that moment is cleared. Before suspend, the daemon holds the system
+  back for a few seconds at most until this is done.
 
 ### Settings
 

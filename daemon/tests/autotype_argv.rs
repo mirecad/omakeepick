@@ -42,7 +42,7 @@ async fn field_values_reach_wtype_on_stdin_only() {
     assert!(autotype::parse("{USERNAME}{TAB}+{PASSWORD}", &entry).is_err());
 
     let tokens = autotype::parse("^a{USERNAME}{TAB}{PASSWORD}{TAB}{TOTP}{ENTER}", &entry).unwrap();
-    autotype::run(&tokens, &mut Wtype, 0).await.unwrap();
+    autotype::run(&tokens, &mut Wtype, 0, || true).await.unwrap();
 
     // Only flags, modifier and key names, delays, and the chord's own literal `a`.
     let args = fs::read_to_string(log.join("args")).unwrap();

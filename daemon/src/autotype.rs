@@ -259,9 +259,22 @@ pub trait Typist {
     async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String>;
 }
 
-pub async fn run(tokens: &[Token], typist: &mut impl Typist, key_delay: u64) -> Result<(), String> {
+/// The error `run` returns when `keep_going` says to stop.
+pub const CANCELLED: &str = "cancelled";
+
+/// Types `tokens`. `keep_going` is asked before every token, so a lock that arrives while a
+/// sequence is being typed stops it before the next field is typed.
+pub async fn run(
+    tokens: &[Token],
+    typist: &mut impl Typist,
+    key_delay: u64,
+    keep_going: impl Fn() -> bool,
+) -> Result<(), String> {
     let mut delay = key_delay;
     for token in tokens {
+        if !keep_going() {
+            return Err(CANCELLED.into());
+        }
         match token {
             Token::Text(text) => typist.text(text, delay).await?,
             Token::Key { name, mods, repeat } => typist.key(name, mods, *repeat).await?,
@@ -330,7 +343,7 @@ impl Typist for Wtype {
 
 /// XWayland windows mis-handle wtype's per-character keymaps, so text is pasted instead:
 /// copied (as sensitive) to both clipboard and primary selection, then Shift+Insert.
-/// Both selections are cleared when the typist is dropped.
+/// Both selections are cleared by `finish`, which callers run whatever the outcome.
 #[derive(Default)]
 pub struct PasteTypist {
     used: bool,
@@ -481,8 +494,22 @@ mod tests {
     async fn runs_tokens_in_order() {
         let tokens = parse("{USERNAME}{DELAY=3}{TAB}{PASSWORD}", &fields()).unwrap();
         let mut rec = Recorder::default();
-        run(&tokens, &mut rec, 8).await.unwrap();
+        run(&tokens, &mut rec, 8, || true).await.unwrap();
         assert_eq!(rec.0, ["text(madev,8)", "key(Tab,[],1)", "text(p@ss{}~+,3)"]);
+    }
+
+    #[tokio::test]
+    async fn stops_before_the_next_token_once_cancelled() {
+        let tokens = parse("{USERNAME}{TAB}{PASSWORD}{ENTER}", &fields()).unwrap();
+        let mut rec = Recorder::default();
+        // "Locked" after the username and Tab went out.
+        let asked = std::cell::Cell::new(0);
+        let keep_going = || {
+            asked.set(asked.get() + 1);
+            asked.get() <= 2
+        };
+        assert_eq!(run(&tokens, &mut rec, 8, keep_going).await, Err(CANCELLED.to_string()));
+        assert_eq!(rec.0, ["text(madev,8)", "key(Tab,[],1)"]);
     }
 
     #[test]

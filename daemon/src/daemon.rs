@@ -2,6 +2,7 @@
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -272,6 +273,28 @@ pub struct Daemon {
     quit: Notify,
     clipboard: Clipboard,
     reload_tx: mpsc::UnboundedSender<()>,
+    /// Requests that hold secrets outside `core`: unlocks deriving a key, reloads, copies and
+    /// auto-type. `settle` waits for them, so suspend is not allowed while they run.
+    inflight: AtomicUsize,
+    settled: Notify,
+}
+
+/// Counts one request in `Daemon::inflight` while it exists.
+struct Inflight<'a>(&'a Daemon);
+
+impl<'a> Inflight<'a> {
+    fn new(daemon: &'a Daemon) -> Self {
+        daemon.inflight.fetch_add(1, Ordering::SeqCst);
+        Inflight(daemon)
+    }
+}
+
+impl Drop for Inflight<'_> {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.settled.notify_waiters();
+        }
+    }
 }
 
 impl Daemon {
@@ -298,6 +321,8 @@ impl Daemon {
             quit: Notify::new(),
             clipboard: Clipboard::default(),
             reload_tx,
+            inflight: AtomicUsize::new(0),
+            settled: Notify::new(),
         };
         (Arc::new(daemon), reload_rx)
     }
@@ -342,13 +367,39 @@ impl Daemon {
         self.quit.notified().await
     }
 
-    pub fn lock(self: &Arc<Self>, reason: LockReason) {
+    /// Locks right away. The clipboard clear runs in the background; `lock_and_settle` waits
+    /// for it.
+    pub fn lock(self: &Arc<Self>, reason: LockReason) -> Option<tokio::task::JoinHandle<()>> {
         let changed = self.core().lock(reason);
-        if changed {
-            eprintln!("omakeepickd: locked ({})", reason.as_str());
-            self.emit_state();
-            let daemon = self.clone();
-            tokio::spawn(async move { daemon.clipboard.clear_now().await });
+        if !changed {
+            return None;
+        }
+        eprintln!("omakeepickd: locked ({})", reason.as_str());
+        self.emit_state();
+        let daemon = self.clone();
+        Some(tokio::spawn(async move { daemon.clipboard.clear_now().await }))
+    }
+
+    /// Locks, then waits (at most `limit`) until the clipboard is cleared and no request still
+    /// holds secrets outside `core`. Used before suspend and on exit, where "locked" has to mean
+    /// that nothing decrypted is left in RAM or on the clipboard.
+    pub async fn lock_and_settle(self: &Arc<Self>, reason: LockReason, limit: Duration) {
+        let deadline = Instant::now() + limit;
+        let clear = self.lock(reason);
+        let settle = async {
+            if let Some(clear) = clear {
+                let _ = clear.await;
+            }
+            loop {
+                let waiting = self.settled.notified();
+                if self.inflight.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                waiting.await;
+            }
+        };
+        if tokio::time::timeout_at(deadline.into(), settle).await.is_err() {
+            eprintln!("omakeepickd: a request was still running {}s after locking", limit.as_secs());
         }
     }
 
@@ -502,6 +553,7 @@ impl Daemon {
             quickunlock::validate_pin(pin).map_err(ApiError::bad_request)?;
         }
         let epoch = self.begin_busy()?;
+        let _inflight = Inflight::new(self);
         let password = a.password;
         let (p, k) = (path.clone(), keyfile.clone());
         let result = tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
@@ -551,6 +603,7 @@ impl Daemon {
             core.busy = true;
             taken
         };
+        let _inflight = Inflight::new(self);
         self.emit_state();
         let p = path.clone();
         let outcome = tokio::task::spawn_blocking(move || {
@@ -590,9 +643,13 @@ impl Daemon {
                 ok()
             }
             Some(Err(err)) => {
-                // Right PIN, but the file no longer opens with the stored key.
                 let mut core = self.core();
                 core.busy = false;
+                // A file that could not be read (mid-save, unmounted) keeps the PIN key, a file
+                // that no longer opens with the stored key does not.
+                if matches!(err, VaultError::Io(_) | VaultError::NotFound(_)) {
+                    core.restore_quick(blob, epoch);
+                }
                 drop(core);
                 self.emit_state();
                 Err(err.into())
@@ -624,7 +681,8 @@ impl Daemon {
         }
     }
 
-    fn prepare(&self, a: &ActArgs) -> Result<Prepared, ApiError> {
+    /// Resolves an action's secrets. Returns the epoch too: the caller stops if it changes.
+    fn prepare(&self, a: &ActArgs) -> Result<(Prepared, u64), ApiError> {
         let mut guard = self.core();
         let core = &mut *guard;
         let Some(open) = &core.open else { return Err(ApiError::locked()) };
@@ -666,11 +724,17 @@ impl Daemon {
         let path = open.path.clone();
         core.store.record_use(&path, &a.entry, unix_now());
         core.touch();
-        Ok(prepared)
+        Ok((prepared, core.epoch))
+    }
+
+    /// Whether no lock happened since `epoch`.
+    fn still(&self, epoch: u64) -> bool {
+        self.core().epoch == epoch
     }
 
     async fn act(self: &Arc<Self>, a: ActArgs) -> Reply {
-        let prepared = self.prepare(&a)?;
+        let (prepared, epoch) = self.prepare(&a)?;
+        let _inflight = Inflight::new(self);
         self.emit_state();
         let (settings, ttl) = {
             let core = self.core();
@@ -678,11 +742,17 @@ impl Daemon {
         };
         let tool_error = |e: String| match e.strip_prefix("tool_missing:") {
             Some(msg) => ApiError::new("tool_missing", msg),
+            None if e == autotype::CANCELLED => Self::cancelled(),
             None => ApiError::new("failed", e),
         };
         match prepared {
             Prepared::Copy { value, what } => {
                 let ticket = self.clipboard.copy(value.as_bytes()).await.map_err(tool_error)?;
+                if !self.still(epoch) {
+                    // Locked while wl-copy ran: the lock's own clear may have missed this value.
+                    self.clipboard.clear_if_unchanged(ticket, Duration::ZERO).await;
+                    return Err(Self::cancelled());
+                }
                 if ttl > 0 {
                     let daemon = self.clone();
                     tokio::spawn(async move {
@@ -694,13 +764,16 @@ impl Daemon {
             Prepared::Type { tokens } => {
                 tokio::time::sleep(Duration::from_millis(u64::from(settings.autotype_start_delay_ms))).await;
                 let delay = u64::from(settings.type_delay_ms);
+                // A lock during the delay or mid-sequence stops the typing: the focused window
+                // may be the lock screen by now.
+                let keep_going = || self.still(epoch);
                 let result = if focused_is_xwayland().await {
                     let mut typist = PasteTypist::default();
-                    let result = autotype::run(&tokens, &mut typist, delay).await;
+                    let result = autotype::run(&tokens, &mut typist, delay, keep_going).await;
                     typist.finish().await;
                     result
                 } else {
-                    autotype::run(&tokens, &mut Wtype, delay).await
+                    autotype::run(&tokens, &mut Wtype, delay, keep_going).await
                 };
                 result.map_err(tool_error)?;
                 ok()
@@ -744,11 +817,12 @@ impl Daemon {
 
     /// Re-reads the database after it changed on disk (e.g. a Syncthing update).
     pub async fn reload(self: &Arc<Self>) {
-        let (path, key, previous) = {
+        let (path, key, previous, epoch) = {
             let core = self.core();
             let Some(open) = &core.open else { return };
-            (open.path.clone(), open.key.clone(), core.open_fingerprint)
+            (open.path.clone(), open.key.clone(), core.open_fingerprint, core.epoch)
         };
+        let _inflight = Inflight::new(self);
         let current = fingerprint(&path);
         if current.is_none() || current == previous {
             return;
@@ -766,6 +840,10 @@ impl Daemon {
             match result {
                 Ok(db) => {
                     let mut core = self.core();
+                    // Locked meanwhile: this copy is stale even if the same file was unlocked again.
+                    if core.epoch != epoch {
+                        return;
+                    }
                     let Some(open) = core.open.as_mut().filter(|o| o.path == path) else { return };
                     open.replace_database(db);
                     let count = open.index.len();
@@ -780,6 +858,9 @@ impl Daemon {
         }
         if let Some(e) = last_error {
             eprintln!("omakeepickd: reload failed: {e}");
+            if !self.still(epoch) {
+                return;
+            }
             self.core().open_fingerprint = current;
             self.notice("warning", &format!("The database changed on disk but could not be reloaded: {e}"));
         }

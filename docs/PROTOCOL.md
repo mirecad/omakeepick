@@ -92,7 +92,7 @@ A `state` event is sent right after a client connects and after every state chan
 | `lock` | `reason` (optional, `manual` default; `screen` from the lock-screen watcher) | `{}` | — |
 | `close` | — | `{}` | — |
 | `search` | `query` (string), `limit` (int, default 50) | `{"entries": [Entry…], "total": n}` | `locked` |
-| `act` | `entry` (entry id), `action` (see below) | `{}`; copy actions: `{"clearsIn": seconds, "copied": "password"}` | `locked`, `not_found`, `no_field`, `autotype_disabled`, `tool_missing`, `failed` |
+| `act` | `entry` (entry id), `action` (see below) | `{}`; copy actions: `{"clearsIn": seconds, "copied": "password"}` | `locked`, `not_found`, `no_field`, `autotype_disabled`, `tool_missing`, `failed`, `cancelled` |
 | `pickFile` | `kind`: `db` or `keyfile` | `{"path": "/abs/path", "keyfile": "/abs/path" \| null}` (for `db`: the key file last used with that database) | `cancelled`, `failed` |
 | `touch` | — | `{}` | — |
 | `quit` | — | `{}` (the daemon locks, wipes and exits) | — |
@@ -105,7 +105,11 @@ lock (idle, screen lock, suspend) arrives while an `unlock` or `quickUnlock` is 
 unlock's result is discarded when it completes and the request fails with `cancelled`; the
 state stays as the lock left it. A quick unlock cancelled by a lock that keeps the PIN (manual,
 idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether the PIN was right
-(`cancelled`) or wrong (`no_quick_unlock`).
+(`cancelled`) or wrong (`no_quick_unlock`). The same holds for `act`: auto-type stops before
+the next token once a lock happened, and a copy that lands on the clipboard after a lock is
+cleared again; both fail with `cancelled`. A reload that was reading the file is discarded.
+Before suspend and on exit, the daemon waits (a few seconds at most) for such requests to end
+before letting the system sleep.
 
 ### Entry (search result)
 

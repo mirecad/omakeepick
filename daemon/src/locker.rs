@@ -93,9 +93,10 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
     while let Some(signal) = sleeps.next().await {
         let Ok(args) = signal.args() else { continue };
         if args.start {
-            // Synchronous: when this returns the database is wiped, and an unlock still running
-            // has been cancelled, so nothing decrypted can appear afterwards.
-            daemon.lock(LockReason::Sleep);
+            // The database is wiped at once; then wait for the clipboard clear and for any
+            // unlock, reload or action still holding secrets, so they finish (and are
+            // discarded) before the inhibitor is released. logind allows 5 s by default.
+            daemon.lock_and_settle(LockReason::Sleep, std::time::Duration::from_secs(4)).await;
             // Releasing the inhibitor lets the system go to sleep.
             inhibitor = None;
         } else if inhibitor.is_none() {

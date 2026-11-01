@@ -104,9 +104,10 @@ async fn serve() -> anyhow::Result<()> {
             _ = hangup.recv() => break,
         }
     }
-    daemon.lock(crate::daemon::LockReason::Closed);
     let _ = fs::remove_file(&socket);
-    // Give client writers a moment to flush the last replies (e.g. to `quit`).
+    // Wait for the clipboard clear: dropping the runtime would abandon it. This also gives
+    // client writers a moment to flush the last replies (e.g. to `quit`).
+    daemon.lock_and_settle(crate::daemon::LockReason::Closed, Duration::from_secs(2)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
     eprintln!("omakeepickd: exiting");
     Ok(())
