@@ -399,7 +399,14 @@ impl Daemon {
             }
         };
         if tokio::time::timeout_at(deadline.into(), settle).await.is_err() {
-            eprintln!("omakeepickd: a request was still running {}s after locking", limit.as_secs());
+            // Nothing more can be done: a key derivation cannot be interrupted, and logind
+            // sleeps once its delay limit is up. The request's result is still discarded.
+            eprintln!(
+                "omakeepickd: {} request(s) still held secrets {:.1}s after locking (raise \
+                 InhibitDelayMaxSec in logind.conf if your key derivation is slow)",
+                self.inflight.load(Ordering::SeqCst),
+                limit.as_secs_f64()
+            );
         }
     }
 

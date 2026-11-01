@@ -181,6 +181,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     can't `ptrace` it or read its memory.
   - Its memory is not pinned, so while unlocked the kernel may swap it. Locking, including the
     automatic lock before suspend or hibernate, wipes the decrypted database first.
+  - Before suspend, the daemon also waits for an unlock that is still deriving its key, for as
+    long as logind allows (`InhibitDelayMaxSec` in `/etc/systemd/logind.conf`, 5 s by default,
+    15 s on Omarchy). A key derivation can't be interrupted, so if yours takes longer than that
+    and the machine hibernates at that moment, the credentials of that one unlock are in the
+    hibernation image. Raise the limit, or shorten the derivation in KeePassXC, if that matters
+    to you. On Omarchy the swap, and so the image, is inside the encrypted disk.
 - **The prebuilt helper is pinned.** Each commit of the plugin names the SHA-256 of the one
   release binary it installs (`bin/omakeepickd.sha256`), so a release file swapped later is
   refused. From 0.1.1 on, release binaries also carry a GitHub build attestation, and

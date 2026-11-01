@@ -108,8 +108,8 @@ idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether th
 (`cancelled`) or wrong (`no_quick_unlock`). The same holds for `act`: auto-type stops before
 the next token once a lock happened, and a copy that lands on the clipboard after a lock is
 cleared again; both fail with `cancelled`. A reload that was reading the file is discarded.
-Before suspend and on exit, the daemon waits (a few seconds at most) for such requests to end
-before letting the system sleep.
+Before suspend the daemon waits for such requests to end before letting the system sleep, for as
+long as logind's `InhibitDelayMaxSec` allows; on exit, for up to 2 s.
 
 ### Entry (search result)
 
