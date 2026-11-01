@@ -1,6 +1,6 @@
 [package]
 name = "omakeepickd"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.89"
 description = "Helper daemon for the OmaKeePick Omarchy shell plugin: opens a KeePass KDBX database and serves search, copy and auto-type requests"
