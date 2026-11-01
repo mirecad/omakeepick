@@ -116,6 +116,8 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
 - After an idle or screen lock, the PIN opens it again.
 - After 3 wrong PINs, after suspend or hibernate, or after *Close database*, the PIN no longer
   works and you need the master password.
+- A lock always wins. If the screen locks or the machine suspends while an unlock is still
+  running, that unlock is discarded and the database stays locked.
 
 ### Settings
 

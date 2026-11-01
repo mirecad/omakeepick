@@ -103,12 +103,25 @@ impl Conn {
     }
 
     fn request(&mut self, cmd: &str, args: Value) -> Value {
+        let id = self.send(cmd, args);
+        self.reply(id)
+    }
+
+    /// Sends a request without waiting; `reply` collects its answer later.
+    fn send(&mut self, cmd: &str, args: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
         let mut req = args.as_object().cloned().unwrap_or_default();
         req.insert("id".into(), json!(id));
         req.insert("cmd".into(), json!(cmd));
         writeln!(self.writer, "{}", Value::Object(req)).unwrap();
+        id
+    }
+
+    fn reply(&mut self, id: i64) -> Value {
+        if let Some(i) = self.events.iter().position(|m| m.get("id") == Some(&json!(id))) {
+            return self.events.remove(i);
+        }
         loop {
             let msg = self.read();
             if msg.get("id") == Some(&json!(id)) {
@@ -241,6 +254,79 @@ fn lifecycle_search_and_quick_unlock() {
         "bad_request"
     );
     assert_eq!(conn.request("frobnicate", json!({}))["error"], "unknown_command");
+}
+
+/// A lock, close or suspend that arrives while an unlock is still running must win: the
+/// unlock's result is dropped instead of reopening the database afterwards.
+#[test]
+fn a_lock_during_an_unlock_wins() {
+    let env = Env::new();
+    let _daemon = env.serve();
+    let mut conn = env.connect();
+    let real = env.db_copy();
+    let bytes = std::fs::read(&real).unwrap();
+
+    // The database path is a symlink. Pointed at a FIFO, an unlock blocks in its read until
+    // the test feeds it the file, so a lock can be sent while the unlock is in flight.
+    let fifo = env.dir.path().join("fifo");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let db = env.dir.path().join("Linked.kdbx");
+    let point_at = |target: &Path| {
+        let fresh = env.dir.path().join("link.tmp");
+        std::os::unix::fs::symlink(target, &fresh).unwrap();
+        std::fs::rename(&fresh, &db).unwrap();
+    };
+    let feed = || std::fs::write(&fifo, &bytes).unwrap();
+    // Sends an unlock and returns once the daemon reports it as running. Older state events
+    // are dropped first, so a `busy` left over from an earlier step cannot satisfy the wait.
+    let start = |conn: &mut Conn, cmd: &str, args: Value| {
+        conn.events.clear();
+        let id = conn.send(cmd, args);
+        conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
+        id
+    };
+
+    // Full unlock, cancelled by a screen lock.
+    point_at(&fifo);
+    let id = start(&mut conn, "unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));
+    assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
+    feed();
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
+    assert_eq!(state["quickUnlock"], false);
+    assert_eq!(conn.request("search", json!({"query": "git"}))["error"], "locked");
+
+    // Quick unlock cancelled by a screen lock keeps the PIN; cancelled by suspend, loses it.
+    point_at(&real);
+    assert_eq!(unlock(&mut conn, &db, Some("2468"))["ok"], true);
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    for (reason, keeps_pin) in [("screen", true), ("sleep", false)] {
+        point_at(&fifo);
+        let id = start(&mut conn, "quickUnlock", json!({"pin": "2468"}));
+        assert_eq!(conn.request("lock", json!({"reason": reason}))["ok"], true);
+        feed();
+        assert_eq!(conn.reply(id)["error"], "cancelled", "{reason}");
+        let state = conn.state();
+        assert_eq!(state["phase"], "locked", "{reason}");
+        assert_eq!(state["busy"], false, "{reason}");
+        assert_eq!(state["quickUnlock"], keeps_pin, "{reason}");
+        assert_eq!(state["lockReason"], reason);
+    }
+    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["error"], "no_quick_unlock");
+
+    // Close during a full unlock: nothing is left to reopen.
+    let id = start(&mut conn, "unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));
+    assert_eq!(conn.request("close", json!({}))["ok"], true);
+    feed();
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["quickUnlock"].clone()), (json!("closed"), json!(false)));
+
+    // Without an interruption the same path unlocks.
+    point_at(&real);
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 7);
 }
 
 #[test]

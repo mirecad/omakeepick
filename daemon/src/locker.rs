@@ -93,6 +93,8 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
     while let Some(signal) = sleeps.next().await {
         let Ok(args) = signal.args() else { continue };
         if args.start {
+            // Synchronous: when this returns the database is wiped, and an unlock still running
+            // has been cancelled, so nothing decrypted can appear afterwards.
             daemon.lock(LockReason::Sleep);
             // Releasing the inhibitor lets the system go to sleep.
             inhibitor = None;

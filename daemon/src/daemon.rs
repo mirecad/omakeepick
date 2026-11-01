@@ -68,6 +68,9 @@ pub struct Core {
     open_fingerprint: Fingerprint,
     locked: Option<LockedDb>,
     busy: bool,
+    /// Bumped by every lock. An unlock captures it when it starts and its result is installed
+    /// only if it is unchanged, so a lock, close or suspend during an unlock always wins.
+    epoch: u64,
     lock_reason: Option<LockReason>,
     last_activity: Instant,
     store: Store,
@@ -135,19 +138,27 @@ impl Core {
         })
     }
 
-    /// Returns whether anything changed.
+    /// Returns whether anything changed. Cancelling an unlock that is still running counts: its
+    /// result would otherwise reopen the database after this lock.
     fn lock(&mut self, reason: LockReason) -> bool {
         self.watcher = None;
-        if let Some(open) = self.open.take() {
+        self.epoch += 1;
+        let interrupted = self.busy;
+        let changed = if let Some(open) = self.open.take() {
             let OpenDb { path, keyfile, quick, .. } = open;
             let quick = if reason.wipes_quick_unlock() { None } else { quick };
             self.locked = Some(LockedDb { path, keyfile, quick });
+            true
         } else if let Some(locked) = &mut self.locked {
-            if !reason.wipes_quick_unlock() || locked.quick.is_none() {
-                return false;
+            let wiped = reason.wipes_quick_unlock() && locked.quick.is_some();
+            if wiped {
+                locked.quick = None;
             }
-            locked.quick = None;
+            wiped
         } else {
+            false
+        };
+        if !changed && !interrupted {
             return false;
         }
         self.lock_reason = Some(reason);
@@ -253,6 +264,7 @@ impl Daemon {
                 open_fingerprint: None,
                 locked: None,
                 busy: false,
+                epoch: 0,
                 lock_reason: None,
                 last_activity: Instant::now(),
                 store: Store::load(state_dir),
@@ -416,20 +428,31 @@ impl Daemon {
         ok_with(json!({"entries": entries, "total": total}))
     }
 
-    fn begin_busy(&self) -> Result<(), ApiError> {
+    /// Marks an unlock as running and returns the epoch its result must be installed under.
+    fn begin_busy(&self) -> Result<u64, ApiError> {
         let mut core = self.core();
         if core.busy {
             return Err(ApiError::new("busy", "Already unlocking"));
         }
         core.busy = true;
+        let epoch = core.epoch;
         drop(core);
         self.emit_state();
-        Ok(())
+        Ok(epoch)
     }
 
-    /// Installs a freshly opened database.
-    fn install(self: &Arc<Self>, open: OpenDb) {
+    fn cancelled() -> ApiError {
+        ApiError::new("cancelled", "Locked before the unlock finished")
+    }
+
+    /// Installs a freshly opened database. If a lock arrived while it was being opened, the
+    /// database is handed back (rejected) instead and the state stays as the lock left it.
+    fn install(self: &Arc<Self>, open: OpenDb, epoch: u64) -> Option<OpenDb> {
         let mut core = self.core();
+        if core.epoch != epoch {
+            core.busy = false;
+            return Some(open);
+        }
         let path = open.path.clone();
         core.store.remember(&path, open.keyfile.as_deref());
         let live: std::collections::HashSet<String> = open.index.iter().map(|e| e.uuid.clone()).collect();
@@ -443,6 +466,7 @@ impl Daemon {
         core.lock_reason = None;
         core.busy = false;
         core.touch();
+        None
     }
 
     async fn unlock(self: &Arc<Self>, a: UnlockArgs) -> Reply {
@@ -455,7 +479,7 @@ impl Daemon {
         if let Some(pin) = &pin {
             quickunlock::validate_pin(pin).map_err(ApiError::bad_request)?;
         }
-        self.begin_busy()?;
+        let epoch = self.begin_busy()?;
         let password = a.password;
         let (p, k) = (path.clone(), keyfile.clone());
         let result = tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
@@ -472,9 +496,13 @@ impl Daemon {
         .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))));
         match result {
             Ok(open) => {
-                eprintln!("omakeepickd: unlocked {} ({} entries)", path.display(), open.index.len());
-                self.install(open);
+                let count = open.index.len();
+                let rejected = self.install(open, epoch);
                 self.emit_state();
+                if rejected.is_some() {
+                    return Err(Self::cancelled());
+                }
+                eprintln!("omakeepickd: unlocked {} ({count} entries)", path.display());
                 ok()
             }
             Err(err) => {
@@ -486,7 +514,7 @@ impl Daemon {
     }
 
     async fn quick_unlock(self: &Arc<Self>, a: PinArgs) -> Reply {
-        let (path, keyfile, mut blob) = {
+        let (path, keyfile, mut blob, epoch) = {
             let mut core = self.core();
             if core.busy {
                 return Err(ApiError::new("busy", "Already unlocking"));
@@ -497,7 +525,7 @@ impl Daemon {
             let Some(blob) = locked.quick.take() else {
                 return Err(ApiError::new("no_quick_unlock", "Quick unlock is not available"));
             };
-            let taken = (locked.path.clone(), locked.keyfile.clone(), blob);
+            let taken = (locked.path.clone(), locked.keyfile.clone(), blob, core.epoch);
             core.busy = true;
             taken
         };
@@ -520,7 +548,19 @@ impl Daemon {
         };
         match opened {
             Some(Ok((key, db))) => {
-                self.install(OpenDb::new(path, keyfile, key, Some(blob), db));
+                if let Some(rejected) = self.install(OpenDb::new(path, keyfile, key, Some(blob), db), epoch) {
+                    // A lock that keeps quick unlock (screen, idle, manual) gets the PIN key
+                    // back; sleep and close have wiped it.
+                    let OpenDb { quick, .. } = rejected;
+                    let mut core = self.core();
+                    let keep = !core.lock_reason.is_some_and(LockReason::wipes_quick_unlock);
+                    if let Some(locked) = core.locked.as_mut().filter(|_| keep) {
+                        locked.quick = quick;
+                    }
+                    drop(core);
+                    self.emit_state();
+                    return Err(Self::cancelled());
+                }
                 self.emit_state();
                 ok()
             }
