@@ -3,6 +3,9 @@ name: Release
 # Push a tag vX.Y.Z matching manifest.json and daemon/Cargo.toml, then pin the binary's
 # SHA-256 in bin/omakeepickd.sha256 (see "Releasing" in the README). The plugin's bin/install
 # downloads the binary attached here and checks it against that pin.
+#
+# Actions are pinned by commit: this job holds a token that can publish releases, so a
+# moved tag in a third-party action must not be able to change what it does.
 on:
   push:
     tags: ["v*"]
@@ -18,12 +21,17 @@ jobs:
   release:
     runs-on: ubuntu-22.04 # older glibc, so the binary runs on more systems
     steps:
-      - uses: actions/checkout@v7
-      - name: Tag matches the plugin version
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Tag matches the plugin and daemon versions
         run: |
           plugin="$(jq -r .version manifest.json)"
+          daemon="$(sed -n 's/^version = "\(.*\)"/\1/p' daemon/Cargo.toml | head -1)"
           test "v$plugin" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME != manifest $plugin"; exit 1; }
-      - uses: dtolnay/rust-toolchain@stable
+          test "$plugin" = "$daemon" || { echo "manifest.json $plugin != Cargo.toml $daemon"; exit 1; }
+      # The toolchain comes from daemon/rust-toolchain.toml, so the build is reproducible.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
+        with:
+          toolchain: 1.99.1
       - run: cargo test --locked --release
         working-directory: daemon
       - run: cargo build --locked --release
@@ -35,10 +43,10 @@ jobs:
           cd dist && sha256sum omakeepickd-x86_64-linux > omakeepickd-x86_64-linux.sha256
       # Lets anyone check that the binary was built here, from this tag:
       # gh attestation verify omakeepickd-x86_64-linux -R <owner>/<repo>
-      - uses: actions/attest@v4
+      - uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
           subject-path: dist/omakeepickd-x86_64-linux
-      - uses: softprops/action-gh-release@v3
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: |
             dist/omakeepickd-x86_64-linux

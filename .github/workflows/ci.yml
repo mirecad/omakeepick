@@ -5,15 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Actions pinned by commit, as in release.yml.
 jobs:
   daemon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable branch, 2026-10
         with:
+          toolchain: 1.99.1
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           workspaces: daemon
       - run: cargo fmt --check
@@ -26,8 +28,8 @@ jobs:
   model:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
       - run: node --test tests/*.test.js
@@ -37,12 +39,18 @@ jobs:
           daemon="$(sed -n 's/^version = "\(.*\)"/\1/p' daemon/Cargo.toml | head -1)"
           test "$plugin" = "$daemon" || { echo "manifest.json $plugin != Cargo.toml $daemon"; exit 1; }
       # main must pin the binary of a published release (the tag goes first, see the README).
-      - name: The pinned helper binary is the released one
+      # The binary itself is hashed, not the .sha256 text next to it, and its build
+      # attestation must name this repository's release workflow.
+      - name: The pinned helper binary is the released, attested one
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           plugin="$(jq -r .version manifest.json)"
           read -r pinned sha < bin/omakeepickd.sha256
           test "$pinned" = "$plugin" || { echo "bin/omakeepickd.sha256 pins $pinned, manifest.json is $plugin"; exit 1; }
-          released="$(gh release download "v$plugin" -R "$GITHUB_REPOSITORY" -p omakeepickd-x86_64-linux.sha256 -O - | cut -d' ' -f1)"
+          mkdir -p /tmp/release && cd /tmp/release
+          gh release download "v$plugin" -R "$GITHUB_REPOSITORY" -p omakeepickd-x86_64-linux
+          released="$(sha256sum omakeepickd-x86_64-linux | cut -d' ' -f1)"
           test "$sha" = "$released" || { echo "pinned $sha, but release v$plugin has $released"; exit 1; }
+          gh attestation verify omakeepickd-x86_64-linux -R "$GITHUB_REPOSITORY" \
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"

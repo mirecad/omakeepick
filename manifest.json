@@ -47,7 +47,7 @@
         "max": 1440,
         "step": 5,
         "defaultValue": 30,
-        "description": "Lock the database after this many minutes without a search or an action. 0 never locks on idle. Locking the screen always locks the database."
+        "description": "Lock the database after this many minutes without a search or an action. 0 never locks on idle. Locking the screen or suspending also locks the database."
       },
       {
         "key": "clipboardClearSeconds",

@@ -67,8 +67,9 @@ pkill -x omakeepickd   # stop the helper; it locks and wipes the database first
 
 Then delete the `SUPER + SHIFT + K` binding and the `omakeepick` layer rule, if you added them.
 OmaKeePick never writes to your database, so there is nothing else to undo. To also forget the
-last database path and the usage counts, delete `~/.local/state/omakeepick`. A helper built from
-source leaves a build cache in `~/.cache/omakeepick`.
+last database path, the usage counts and the helper's log (which names the database file),
+delete `~/.local/state/omakeepick`. The installer's working directory, and the build cache of a
+helper built from source, is `~/.cache/omakeepick`.
 
 ## Use
 
@@ -152,6 +153,9 @@ The syntax is the KeePass/KeePassXC subset that matters for logins:
   would have to go on `wtype`'s command line.
 - **Timing:** `{DELAY 500}` pauses, and `{DELAY=20}` sets the delay between keystrokes.
 - **Other:** `{CLEARFIELD}`, plus the literal escapes `{+}` `{^}` `{%}` `{~}` `{{}` `{}}`.
+- **Refused on purpose:** Alt (`%`) and the `{WIN}` keys, because a sequence stored in a shared
+  database could use them to move focus to another window before typing the password. A
+  sequence is limited to 4096 characters and types at most 8192 characters.
 
 In XWayland windows (old Electron and Java apps), text is pasted via the clipboard instead of
 typed. The clipboard is cleared afterwards.
@@ -196,8 +200,13 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
 - **How the PIN works.** With a PIN, the daemon keeps the database credentials in memory,
   encrypted with `ChaCha20-Poly1305` under a key derived from the PIN with `Argon2id`
   (64 MiB). Three wrong PINs, suspend, hibernate, *Close database* or the daemon exiting
-  destroy that copy. A short PIN is only as strong as this process's memory isolation. If
-  that worries you, don't set one.
+  destroy that copy. The three-try limit holds only inside the running daemon: anyone who can
+  read its memory can try PINs offline, and a 4-digit PIN falls in minutes. So the PIN is only
+  as strong as this process's memory isolation. If that worries you, don't set one.
+- **What "locked" means.** Locking drops the decrypted database, the key material and the
+  clipboard value. Live secrets are wiped where the code holds them; memory that the parser
+  library freed on its own is not scrubbed, which on Omarchy matters little because swap, and
+  so a hibernation image, is inside the encrypted disk.
 - **Not stored anywhere:** passwords or PINs. `~/.local/state/omakeepick/state.json` holds
   only the last database and key-file paths, plus per-entry use counts (by UUID) for ranking.
 
@@ -231,12 +240,17 @@ password is `test-password`.
 2. Commit, and tag the commit `vX.Y.Z`.
 3. Push only the tag: `git push origin vX.Y.Z`. The release workflow attaches
    `omakeepickd-x86_64-linux`, its `.sha256` and a build attestation.
-4. Pin the new binary, and commit:
+4. Verify the binary and pin it, then commit:
 
    ```bash
-   printf '%s %s\n' X.Y.Z "$(gh release download vX.Y.Z -p '*.sha256' -O - | cut -d' ' -f1)" \
+   gh release download vX.Y.Z -p omakeepickd-x86_64-linux -D /tmp/rel
+   gh attestation verify /tmp/rel/omakeepickd-x86_64-linux -R mirecad/omakeepick
+   printf '%s %s\n' X.Y.Z "$(sha256sum /tmp/rel/omakeepickd-x86_64-linux | cut -d' ' -f1)" \
      > bin/omakeepickd.sha256
    ```
+
+   CI repeats both checks on `main`: the pinned hash must be that of the release binary, and
+   the binary's attestation must name this repository's release workflow.
 
 5. Push `main`. `omarchy plugin update` follows `main`, and a plugin whose version has no pinned
    binary builds the daemon from source instead. CI checks the pin against the release.

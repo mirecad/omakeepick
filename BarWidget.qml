@@ -58,7 +58,7 @@ Panel {
         // card shows the error where Ctrl+O tries again.
         var message = Model.errorText(reply)
         if (!target.openPicker(JSON.stringify({ unlock: true, error: message })))
-          target.notify("OmaKeePick", message, "normal")
+          target.notify("OmaKeePick", Model.notificationErrorText(reply), "normal")
       }
     })
   }

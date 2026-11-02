@@ -177,7 +177,7 @@ Item {
     if (!entry || !entry.id) return 0
     return request("act", { entry: entry.id, action: action }, function(reply) {
       if (!reply.ok) {
-        if (reply.error !== "cancelled") root.notify("OmaKeePick", Model.errorText(reply), "normal")
+        if (reply.error !== "cancelled") root.notify("OmaKeePick", Model.notificationErrorText(reply), "normal")
       } else if (Model.isCopyAction(action) && root.notifyOnCopy) {
         root.notify(Model.copiedText(action, reply.clearsIn), "", "low")
       }
@@ -256,7 +256,12 @@ Item {
   }
 
   function applyState(message) {
+    var wasUnlocked = _state.phase === "unlocked"
     _state = Model.normalizeState(message)
+    // The daemon locked itself for the screen lock or suspend: take the picker down too,
+    // so no card (with whatever was typed into it) sits under the lock screen.
+    if (wasUnlocked && _state.phase !== "unlocked"
+        && (_state.lockReason === "screen" || _state.lockReason === "sleep")) closePicker()
     if (!_connected) {
       _connected = true
       _daemonMissing = false
@@ -307,8 +312,9 @@ Item {
   // Its IPC target is the supported way to ask, the same one omarchy.idle
   // uses, and it is only asked while there is something to lock.
   function screenLocked() {
-    if (phase !== "unlocked") return
+    // Even when nothing is unlocked: an unlock card may hold a half-typed master password.
     closePicker()
+    if (phase !== "unlocked") return
     lock("screen", null)
   }
 

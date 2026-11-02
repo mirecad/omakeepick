@@ -39,11 +39,13 @@ download() {
   fi
   local base="https://github.com/$repo/releases/download/v$version"
   say "downloading $asset $version from github.com/$repo"
-  curl -fsSL --retry 2 --connect-timeout 10 -o "$work/$asset" "$base/$asset" ||
-    { say "download failed"; return 1; }
+  curl -fsSL --proto '=https' --proto-redir '=https' --retry 2 --connect-timeout 10 --max-time 300 \
+    -o "$work/$asset" "$base/$asset" || { say "download failed"; return 1; }
   if [[ $(sha256sum "$work/$asset" | cut -d' ' -f1) != "$pinned_sha" ]]; then
-    say "checksum mismatch, refusing the download"
-    return 1
+    # Not a reason to quietly build instead: the release does not match the reviewed commit.
+    say "the downloaded omakeepickd does not match the checksum pinned in bin/omakeepickd.sha256."
+    say "Refusing it. If you trust this checkout, build from source: bin/install --source"
+    exit 1
   fi
   install -m 0755 "$work/$asset" "$work/omakeepickd"
 }
@@ -70,14 +72,18 @@ else
 fi
 
 got="$("$work/omakeepickd" --version | cut -d' ' -f2)"
-[[ $got == "$version" ]] || say "warning: installed omakeepickd $got for plugin version $version"
-
-# Stop a daemon of another version; the plugin starts the new one.
-if [[ -x $target ]]; then
-  running="$("$target" ctl status 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || true
-  if [[ -n $running && $running != "$got" ]]; then
-    "$target" ctl quit >/dev/null 2>&1 || true
-  fi
+if [[ $got != "$version" ]]; then
+  # The plugin would see a version mismatch and run this installer again on every start.
+  say "$how omakeepickd reports version $got, but the plugin is $version; not installing it"
+  exit 1
 fi
-mv -f "$work/omakeepickd" "$target"
+
+# Into place first, atomically (same directory, so the rename cannot be a copy), then stop a
+# daemon of another version; whatever starts next picks up the new file.
+install -m 0755 "$work/omakeepickd" "$target.new"
+mv -f "$target.new" "$target"
+running="$("$target" ctl status 2>/dev/null | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')" || true
+if [[ -n $running && $running != "$got" ]]; then
+  "$target" ctl quit >/dev/null 2>&1 || true
+fi
 say "installed omakeepickd $got ($how)"

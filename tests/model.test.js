@@ -246,6 +246,13 @@ test("error text prefers the daemon's message, then a friendly default", () => {
   assert.equal(Model.errorText(null), "Something went wrong")
 })
 
+test("notification error text never carries the daemon's free-form message", () => {
+  assert.equal(Model.notificationErrorText({ ok: false, error: "failed", message: "Cannot read /home/me/Secrets.kdbx" }), "Something went wrong")
+  assert.equal(Model.notificationErrorText({ ok: false, error: "bad_credentials", message: "whatever" }), "Wrong password or key file")
+  assert.equal(Model.notificationErrorText({ ok: false, error: "cancelled" }), "Something went wrong")
+  assert.equal(Model.notificationText("x".repeat(300)).length, 200)
+})
+
 test("copy notifications name the field and the countdown", () => {
   assert.equal(Model.copiedText("copyPassword", 15), "Password copied · clears in 15s")
   assert.equal(Model.copiedText("copyTotp", 0), "TOTP copied")

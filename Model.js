@@ -326,9 +326,21 @@ function copiedText(action, clearsIn) {
 }
 
 // A leading dash would be read as an option by omarchy-notification-send.
+// Text for omarchy-notification-send: never starts with "-" (it would be taken for an option)
+// and is kept short, since it travels as a command-line argument.
 function notificationText(value) {
   var text = String(value === undefined || value === null ? "" : value)
+  if (text.length > 200) text = text.slice(0, 199) + "…"
   return text.charAt(0) === "-" ? " " + text : text
+}
+
+// Error text for a notification: the fixed text for the code only, never the daemon's free-form
+// message, which is meant for the card. Notification arguments are readable by other local
+// users and kept in the notification history.
+function notificationErrorText(reply) {
+  var r = isPlainObject(reply) ? reply : {}
+  var code = String(r.error || "failed")
+  return ERROR_TEXT[code] !== undefined && ERROR_TEXT[code] !== "" ? ERROR_TEXT[code] : ERROR_TEXT.failed
 }
 
 function noticeUrgency(level) {
@@ -587,6 +599,7 @@ if (typeof module !== "undefined" && module.exports) {
     normalizeEntries: normalizeEntries,
     backoffDelay: backoffDelay,
     errorText: errorText,
+    notificationErrorText: notificationErrorText,
     isCopyAction: isCopyAction,
     isTypeAction: isTypeAction,
     entrySupports: entrySupports,
