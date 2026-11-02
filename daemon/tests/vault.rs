@@ -52,7 +52,7 @@ fn indexes_searchable_entries_only() {
     assert!(!entries["Router"].autotype);
     assert!(entries["Jira"].has_totp && entries["Bank"].has_totp);
     assert!(!entries["Gitea home server"].has_totp);
-    assert_eq!(entries["Jira"].notes, "Ask IT for the recovery codes.");
+    assert_eq!(*entries["Jira"].notes, "Ask IT for the recovery codes.");
 }
 
 #[test]

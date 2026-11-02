@@ -1,0 +1,4 @@
+# The exact toolchain the release binaries are built with, so a pinned SHA-256 can be
+# re-derived from its tag. Bump deliberately; CI and the release workflow use this file.
+[toolchain]
+channel = "1.99.1"

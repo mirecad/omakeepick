@@ -44,7 +44,12 @@ pub fn run(detach: bool) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(serve()) {
+    let outcome = runtime.block_on(serve());
+    // Dropping the runtime would wait forever for a blocking task that cannot finish (a key
+    // derivation that was given absurd parameters); abandon it instead so the process exits
+    // and releases the instance lock.
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("omakeepickd: {e:#}");
@@ -115,7 +120,9 @@ async fn serve() -> anyhow::Result<()> {
 
 async fn client(daemon: Arc<Daemon>, stream: UnixStream) {
     let (reader, mut writer) = stream.into_split();
-    let (replies, mut queued) = mpsc::unbounded_channel::<String>();
+    // Bounded: a client that sends requests but never reads replies stops being read instead
+    // of growing the queue without limit.
+    let (replies, mut queued) = mpsc::channel::<String>(256);
     let mut events = daemon.subscribe();
     let first = daemon.state_line();
     let writer_task = tokio::spawn(async move {
@@ -146,7 +153,8 @@ async fn client(daemon: Arc<Daemon>, stream: UnixStream) {
             Ok(h) => h,
             Err(e) => {
                 let _ = replies
-                    .send(encode_reply(None, Err(ApiError::bad_request(format!("Invalid request: {e}")))));
+                    .send(encode_reply(None, Err(ApiError::bad_request(format!("Invalid request: {e}")))))
+                    .await;
                 continue;
             }
         };
@@ -154,11 +162,11 @@ async fn client(daemon: Arc<Daemon>, stream: UnixStream) {
             let (daemon, replies) = (daemon.clone(), replies.clone());
             tokio::spawn(async move {
                 let reply = daemon.handle_async(&header.cmd, &line).await;
-                let _ = replies.send(encode_reply(header.id, reply));
+                let _ = replies.send(encode_reply(header.id, reply)).await;
             });
         } else {
             let reply = daemon.handle_sync(&header.cmd, &line);
-            let _ = replies.send(encode_reply(header.id, reply));
+            let _ = replies.send(encode_reply(header.id, reply)).await;
         }
     }
     // Let in-flight replies drain briefly before closing.

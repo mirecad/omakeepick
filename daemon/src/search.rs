@@ -149,7 +149,7 @@ mod tests {
             url_match: url.into(),
             group: group.into(),
             tags: String::new(),
-            notes: notes.into(),
+            notes: zeroize::Zeroizing::new(notes.to_string()),
             has_password: true,
             has_totp: false,
             autotype: true,

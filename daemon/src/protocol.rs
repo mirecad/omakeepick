@@ -84,7 +84,8 @@ pub fn encode_reply(id: Option<i64>, reply: Reply) -> String {
 
 /// Parses the arguments of a request from its raw line.
 pub fn args<'de, T: Deserialize<'de>>(line: &'de [u8]) -> Result<T, ApiError> {
-    serde_json::from_slice(line).map_err(|e| ApiError::bad_request(format!("Invalid arguments: {e}")))
+    // serde's message would echo the offending value, which could be a mistyped secret.
+    serde_json::from_slice(line).map_err(|_| ApiError::bad_request("Invalid arguments"))
 }
 
 /// Reads `\n`-terminated lines and wipes consumed bytes from its buffer, since request lines

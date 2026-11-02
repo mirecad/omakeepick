@@ -82,6 +82,24 @@ pub struct Core {
     watcher: Option<watch::Watcher>,
 }
 
+/// A key derivation that runs longer than this is abandoned (its thread finishes on its own and
+/// the result is dropped). Legitimate derivations take a second or two; the header check in
+/// `vault` already refuses absurd parameters, so this is the backstop.
+const KDF_TIMEOUT: Duration = Duration::from_secs(120);
+const TOOK_TOO_LONG: &str = "Opening the database took too long and was abandoned";
+
+const MAX_QUERY_BYTES: usize = 256;
+const MAX_QUERY_ATOMS: usize = 16;
+
+/// Test hook: with `OMAKEEPICK_TEST_HOLD` set to a FIFO, an unlock blocks there until the test
+/// writes to it, so a lock can be sent while the unlock is in flight. Debug builds only.
+fn test_hold() {
+    #[cfg(debug_assertions)]
+    if let Some(fifo) = std::env::var_os("OMAKEEPICK_TEST_HOLD") {
+        let _ = std::fs::read(fifo);
+    }
+}
+
 fn unix_now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
@@ -477,6 +495,11 @@ impl Daemon {
     }
 
     fn search(&self, a: SearchArgs) -> Reply {
+        // Scoring is linear in atoms × entries and runs on the one runtime thread.
+        if a.query.len() > MAX_QUERY_BYTES {
+            return Err(ApiError::bad_request("The query is too long"));
+        }
+        let query: String = a.query.split_whitespace().take(MAX_QUERY_ATOMS).collect::<Vec<_>>().join(" ");
         let mut guard = self.core();
         let core = &mut *guard;
         let Some(open) = &core.open else { return Err(ApiError::locked()) };
@@ -484,7 +507,7 @@ impl Daemon {
         let empty = Default::default();
         let usage = core.store.usage(&open.path).unwrap_or(&empty);
         let (hits, total) =
-            core.searcher.search(&open.index, &a.query, usage, limit, core.settings.recent_count, unix_now());
+            core.searcher.search(&open.index, &query, usage, limit, core.settings.recent_count, unix_now());
         let entries: Vec<Value> = hits
             .into_iter()
             .map(|i| {
@@ -563,7 +586,8 @@ impl Daemon {
         let _inflight = Inflight::new(self);
         let password = a.password;
         let (p, k) = (path.clone(), keyfile.clone());
-        let result = tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
+        let worker = tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
+            test_hold();
             let keyfile_bytes = k.as_deref().map(vault::read_keyfile).transpose()?;
             let key = KeyMaterial::new(password, keyfile_bytes)?;
             let db = vault::open_database(&p, &key)?;
@@ -572,9 +596,12 @@ impl Daemon {
                 .transpose()
                 .map_err(VaultError::Io)?;
             Ok(OpenDb::new(p, k, key, quick, db))
-        })
-        .await
-        .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))));
+        });
+        let result = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
+            Ok(joined) => joined.unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}")))),
+            // The worker keeps running on its thread, but its result is never installed.
+            Err(_) => Err(VaultError::Io(TOOK_TOO_LONG.into())),
+        };
         match result {
             Ok(open) => {
                 let count = open.index.len();
@@ -613,7 +640,8 @@ impl Daemon {
         let _inflight = Inflight::new(self);
         self.emit_state();
         let p = path.clone();
-        let outcome = tokio::task::spawn_blocking(move || {
+        let worker = tokio::task::spawn_blocking(move || {
+            test_hold();
             // Read first, check the PIN second: a read error is reported only for a right PIN,
             // and a wrong one costs a try either way.
             let data = vault::read_database(&p);
@@ -621,8 +649,11 @@ impl Daemon {
             let opened =
                 key.map(|key| data.and_then(|data| vault::parse_database(&data, &key)).map(|db| (key, db)));
             (blob, opened)
-        })
-        .await;
+        });
+        let outcome = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
+            Ok(joined) => joined.map_err(|e| e.to_string()),
+            Err(_) => Err(TOOK_TOO_LONG.into()),
+        };
         let (blob, opened) = match outcome {
             Ok(v) => v,
             Err(e) => {
@@ -841,9 +872,11 @@ impl Daemon {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
             let (p, k) = (path.clone(), key.clone());
-            let result = tokio::task::spawn_blocking(move || vault::open_database(&p, &k))
-                .await
-                .unwrap_or_else(|e| Err(VaultError::Io(e.to_string())));
+            let worker = tokio::task::spawn_blocking(move || vault::open_database(&p, &k));
+            let result = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
+                Ok(joined) => joined.unwrap_or_else(|e| Err(VaultError::Io(e.to_string()))),
+                Err(_) => Err(VaultError::Io(TOOK_TOO_LONG.into())),
+            };
             match result {
                 Ok(db) => {
                     let mut core = self.core();
@@ -869,7 +902,8 @@ impl Daemon {
                 return;
             }
             self.core().open_fingerprint = current;
-            self.notice("warning", &format!("The database changed on disk but could not be reloaded: {e}"));
+            // The parser's message can quote text from a malformed file; keep it to the log.
+            self.notice("warning", "The database changed on disk but could not be reloaded");
         }
     }
 }

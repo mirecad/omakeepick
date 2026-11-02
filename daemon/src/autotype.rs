@@ -37,7 +37,8 @@ impl Modifier {
     }
 }
 
-#[derive(Debug, PartialEq)]
+// Debug only in tests: `Text` holds secrets.
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum Token {
     /// Text to type literally. May contain secrets.
     Text(Zeroizing<String>),
@@ -85,8 +86,6 @@ fn key_name(name: &str) -> Option<&'static str> {
         "PRTSC" => "Print",
         "BREAK" => "Break",
         "APPS" => "Menu",
-        "WIN" | "LWIN" => "Super_L",
-        "RWIN" => "Super_R",
         "ADD" => "KP_Add",
         "SUBTRACT" => "KP_Subtract",
         "MULTIPLY" => "KP_Multiply",
@@ -124,10 +123,23 @@ fn key_name(name: &str) -> Option<&'static str> {
 struct Builder {
     tokens: Vec<Token>,
     mods: Vec<Modifier>,
+    /// Whether the last token is literal sequence text, which further literals may join.
+    last_literal: bool,
 }
 
 impl Builder {
+    /// Literal text from the sequence itself. Adjacent literals share one token.
     fn text(&mut self, s: &str) {
+        self.push_text(s, false);
+    }
+
+    /// A field value. Always its own token: growing a Zeroizing<String> would leave the old
+    /// buffer behind unwiped.
+    fn secret(&mut self, s: &str) {
+        self.push_text(s, true);
+    }
+
+    fn push_text(&mut self, s: &str, secret: bool) {
         if s.is_empty() {
             return;
         }
@@ -140,32 +152,47 @@ impl Builder {
         if rest.is_empty() {
             return;
         }
-        if let Some(Token::Text(prev)) = self.tokens.last_mut() {
+        if !secret
+            && self.last_literal
+            && let Some(Token::Text(prev)) = self.tokens.last_mut()
+        {
             prev.push_str(rest);
-        } else {
-            self.tokens.push(Token::Text(Zeroizing::new(rest.to_string())));
+            return;
         }
+        self.tokens.push(Token::Text(Zeroizing::new(rest.to_string())));
+        self.last_literal = !secret;
     }
 
     fn key(&mut self, name: &'static str, repeat: u32) {
         let mods = std::mem::take(&mut self.mods);
         self.tokens.push(Token::Key { name, mods, repeat });
+        self.last_literal = false;
     }
 
     fn plain(&mut self, token: Token) {
         self.mods.clear();
         self.tokens.push(token);
+        self.last_literal = false;
     }
 }
 
+/// Longest sequence accepted. Sequences can come from the database, so from a sync peer.
+const MAX_SEQUENCE_LEN: usize = 4096;
+
 pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> {
-    let mut b = Builder { tokens: Vec::new(), mods: Vec::new() };
+    if sequence.len() > MAX_SEQUENCE_LEN {
+        return Err("The auto-type sequence is too long".into());
+    }
+    let mut b = Builder { tokens: Vec::new(), mods: Vec::new(), last_literal: false };
     let mut chars = sequence.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             '+' => b.mods.push(Modifier::Shift),
             '^' => b.mods.push(Modifier::Ctrl),
-            '%' => b.mods.push(Modifier::Alt),
+            // Alt (and the Super keys, which key_name no longer knows) could move focus to
+            // another window before the password is typed: %{TAB}{PASSWORD}. A sequence from a
+            // shared database must not be able to do that.
+            '%' => return Err("Alt is not supported in auto-type sequences".into()),
             '~' => b.key("Return", 1),
             '{' => {
                 // `{}}` is the literal `}`; otherwise read up to the closing brace.
@@ -245,7 +272,7 @@ fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), 
         return Err("Modifiers before a field are not supported in auto-type sequences".into());
     }
     match fields.field(&field_name)? {
-        Some(value) => b.text(&value),
+        Some(value) => b.secret(&value),
         None => b.mods.clear(),
     }
     Ok(())
@@ -262,6 +289,23 @@ pub trait Typist {
 /// The error `run` returns when `keep_going` says to stop.
 pub const CANCELLED: &str = "cancelled";
 
+const TEXT_CHUNK_CHARS: usize = 64;
+const MAX_TYPED_CHARS: usize = 8192;
+
+/// Splits `text` on character boundaries into pieces of at most `n` characters.
+fn chunks(text: &str, n: usize) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        if rest.is_empty() {
+            return None;
+        }
+        let end = rest.char_indices().nth(n).map_or(rest.len(), |(i, _)| i);
+        let (head, tail) = rest.split_at(end);
+        rest = tail;
+        Some(head)
+    })
+}
+
 /// Types `tokens`. `keep_going` is asked before every token, so a lock that arrives while a
 /// sequence is being typed stops it before the next field is typed.
 pub async fn run(
@@ -271,12 +315,26 @@ pub async fn run(
     keep_going: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut delay = key_delay;
+    let mut typed = 0usize;
     for token in tokens {
         if !keep_going() {
             return Err(CANCELLED.into());
         }
         match token {
-            Token::Text(text) => typist.text(text, delay).await?,
+            Token::Text(text) => {
+                // In small pieces, so a lock stops the typing within a few characters, and
+                // with a ceiling: a sequence from the database could ask for a megabyte.
+                for chunk in chunks(text, TEXT_CHUNK_CHARS) {
+                    typed += chunk.chars().count();
+                    if typed > MAX_TYPED_CHARS {
+                        return Err("The auto-type sequence types too much text".into());
+                    }
+                    if !keep_going() {
+                        return Err(CANCELLED.into());
+                    }
+                    typist.text(chunk, delay).await?;
+                }
+            }
             Token::Key { name, mods, repeat } => typist.key(name, mods, *repeat).await?,
             Token::Chord { text, mods } => typist.chord(*text, mods).await?,
             Token::Delay(ms) => tokio::time::sleep(Duration::from_millis((*ms).min(10_000))).await,
@@ -365,8 +423,11 @@ impl Typist for PasteTypist {
         crate::clipboard::set(text.as_bytes(), true).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
         wtype(&with_mods(&[Modifier::Shift], ["-k".into(), "Insert".into()]), None).await?;
-        // The application reads the selection asynchronously.
+        // The application reads the selection asynchronously; then take the value back at
+        // once, rather than leaving it on both selections until the sequence ends.
         tokio::time::sleep(Duration::from_millis(250)).await;
+        crate::clipboard::clear_all().await;
+        self.used = false;
         Ok(())
     }
 
@@ -464,12 +525,45 @@ mod tests {
 
     #[test]
     fn modifiers_before_fields_are_refused() {
-        for sequence in ["+{PASSWORD}", "^{USERNAME}{TAB}", "%{S:PIN}", "{TAB}+{TOTP}"] {
+        for sequence in ["+{PASSWORD}", "^{USERNAME}{TAB}", "+{S:PIN}", "{TAB}+{TOTP}"] {
             let err = parse(sequence, &fields()).unwrap_err();
             assert!(err.contains("Modifiers before a field"), "{sequence}: {err}");
         }
         // Modifiers on keys and literal characters still work.
         assert!(parse("^a+{TAB}{PASSWORD}", &fields()).is_ok());
+    }
+
+    #[test]
+    fn focus_moving_keys_are_refused() {
+        // A sequence from a shared database must not be able to Alt-Tab or open a launcher
+        // before typing the password.
+        for sequence in ["%{TAB}{PASSWORD}", "%a", "{WIN}", "{LWIN}r", "{RWIN}"] {
+            assert!(parse(sequence, &fields()).is_err(), "{sequence}");
+        }
+        assert!(parse("{%}", &fields()).is_ok());
+        assert!(parse(&"{TAB}".repeat(1000), &fields()).is_err(), "too long");
+    }
+
+    struct Long(usize);
+
+    impl Fields for Long {
+        fn field(&self, _: &str) -> Result<Option<Zeroizing<String>>, String> {
+            Ok(Some(Zeroizing::new("x".repeat(self.0))))
+        }
+    }
+
+    #[tokio::test]
+    async fn long_text_is_chunked_and_capped() {
+        let tokens = parse("{NOTES}", &Long(150)).unwrap();
+        let mut rec = Recorder::default();
+        run(&tokens, &mut rec, 8, || true).await.unwrap();
+        let lens: Vec<usize> = rec.0.iter().map(|s| s.len() - "text(,8)".len()).collect();
+        assert_eq!(lens, [64, 64, 22]);
+
+        let tokens = parse("{NOTES}{NOTES}", &Long(5000)).unwrap();
+        let mut rec = Recorder::default();
+        let err = run(&tokens, &mut rec, 8, || true).await.unwrap_err();
+        assert!(err.contains("too much text"), "{err}");
     }
 
     #[derive(Default)]
@@ -506,7 +600,7 @@ mod tests {
         let asked = std::cell::Cell::new(0);
         let keep_going = || {
             asked.set(asked.get() + 1);
-            asked.get() <= 2
+            asked.get() <= 3 // token, its one chunk, Tab
         };
         assert_eq!(run(&tokens, &mut rec, 8, keep_going).await, Err(CANCELLED.to_string()));
         assert_eq!(rec.0, ["text(madev,8)", "key(Tab,[],1)"]);

@@ -91,7 +91,7 @@ A `state` event is sent right after a client connects and after every state chan
 | `quickUnlock` | `pin` | `{}` | `no_quick_unlock`, `bad_pin` (+ `attemptsLeft`), `busy`, `cancelled` |
 | `lock` | `reason` (optional, `manual` default; `screen` from the lock-screen watcher) | `{}` | — |
 | `close` | — | `{}` | — |
-| `search` | `query` (string), `limit` (int, default 50) | `{"entries": [Entry…], "total": n}` | `locked` |
+| `search` | `query` (string, at most 256 bytes; only the first 16 words count), `limit` (int, default 50, at most 500) | `{"entries": [Entry…], "total": n}` | `locked`, `bad_request` |
 | `act` | `entry` (entry id), `action` (see below) | `{}`; copy actions: `{"clearsIn": seconds, "copied": "password"}` | `locked`, `not_found`, `no_field`, `autotype_disabled`, `tool_missing`, `failed`, `cancelled` |
 | `pickFile` | `kind`: `db` or `keyfile` | `{"path": "/abs/path", "keyfile": "/abs/path" \| null}` (for `db`: the key file last used with that database) | `cancelled`, `failed` |
 | `touch` | — | `{}` | — |

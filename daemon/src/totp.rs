@@ -20,7 +20,8 @@ enum Algorithm {
     Sha512,
 }
 
-#[derive(Debug)]
+// No Debug outside tests: it would print the secret.
+#[cfg_attr(test, derive(Debug))]
 pub struct Spec {
     secret: Zeroizing<Vec<u8>>,
     period: u64,
@@ -149,7 +150,7 @@ fn parse_otp_field(value: &str) -> Result<Spec, String> {
     };
     for pair in query.split('&') {
         let (key, raw) = pair.split_once('=').unwrap_or((pair, ""));
-        let val = Zeroizing::new(percent_decode(raw));
+        let val = percent_decode(raw);
         match key.to_ascii_lowercase().as_str() {
             "secret" | "key" => spec.secret = decode(&val, Encoding::Base32)?,
             "period" | "step" => spec.period = parse_num(Some(&val), 30)?,
@@ -172,9 +173,10 @@ fn parse_otp_field(value: &str) -> Result<Spec, String> {
     spec.checked()
 }
 
-fn percent_decode(s: &str) -> String {
+/// Decoded in place into a wiped buffer: the value may be the TOTP secret.
+fn percent_decode(s: &str) -> Zeroizing<String> {
     let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -188,7 +190,9 @@ fn percent_decode(s: &str) -> String {
         out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
         i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    let mut text = Zeroizing::new(String::with_capacity(out.len()));
+    text.push_str(&String::from_utf8_lossy(&out));
+    text
 }
 
 #[derive(Clone, Copy)]
@@ -203,10 +207,17 @@ fn decode(value: &str, encoding: Encoding) -> Result<Zeroizing<Vec<u8>>, String>
     let compact: Zeroizing<String> = Zeroizing::new(value.chars().filter(|c| !c.is_whitespace()).collect());
     let bytes = match encoding {
         Encoding::Base32 => base32_decode(&compact),
-        Encoding::Hex => (0..compact.len())
-            .step_by(2)
-            .map(|i| compact.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-            .collect::<Option<Vec<u8>>>(),
+        Encoding::Hex => {
+            let mut out = Vec::with_capacity(compact.len() / 2 + 1);
+            let mut ok = true;
+            for i in (0..compact.len()).step_by(2) {
+                match compact.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => out.push(b),
+                    None => ok = false,
+                }
+            }
+            ok.then_some(out)
+        }
         Encoding::Base64 => base64::engine::general_purpose::STANDARD.decode(compact.as_bytes()).ok(),
         Encoding::Utf8 => Some(value.as_bytes().to_vec()),
     };
@@ -256,8 +267,9 @@ fn code_at(spec: &Spec, unix_secs: u64) -> Zeroizing<String> {
             value /= STEAM_ALPHABET.len() as u32;
         }
     } else {
+        use std::fmt::Write;
         let modulus = 10u64.pow(spec.digits);
-        code.push_str(&format!("{:0width$}", u64::from(value) % modulus, width = spec.digits as usize));
+        let _ = write!(code, "{:0width$}", u64::from(value) % modulus, width = spec.digits as usize);
     }
     code
 }
@@ -317,6 +329,6 @@ mod tests {
     fn base32_and_percent_decoding() {
         assert_eq!(base32_decode("jbswy3dpehpk3pxp").unwrap(), b"Hello!\xde\xad\xbe\xef");
         assert_eq!(base32_decode("MZXW6===").unwrap(), b"foo");
-        assert_eq!(percent_decode("a%20b%3D+c%"), "a b= c%");
+        assert_eq!(*percent_decode("a%20b%3D+c%"), "a b= c%");
     }
 }
