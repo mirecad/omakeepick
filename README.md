@@ -237,7 +237,8 @@ password is `test-password`.
 
 1. Bump `version` in both `manifest.json` and `daemon/Cargo.toml`, then run `cargo check` in
    `daemon/` so `Cargo.lock` follows. The workflows build with `--locked`.
-2. Commit, and tag the commit `vX.Y.Z`.
+2. Run `cargo test --locked --release` in `daemon/`: the release workflow tests in release
+   mode, where debug-only test hooks don't exist. Commit, and tag the commit `vX.Y.Z`.
 3. Push only the tag: `git push origin vX.Y.Z`. The release workflow attaches
    `omakeepickd-x86_64-linux`, its `.sha256` and a build attestation.
 4. Verify the binary and pin it, then commit:

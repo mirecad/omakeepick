@@ -260,6 +260,12 @@ fn lifecycle_search_and_quick_unlock() {
 /// unlock's result is dropped instead of reopening the database afterwards.
 #[test]
 fn a_lock_during_an_unlock_wins() {
+    // The hold hook exists in debug builds only; the binary under test has the same profile
+    // as this test, so in a release run (release.yml) nothing would ever read the FIFO.
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
     let env = Env::new();
     // With OMAKEEPICK_TEST_HOLD (debug builds), every unlock first blocks reading this FIFO
     // until the test feeds it, so a lock can be sent while the unlock is in flight.
