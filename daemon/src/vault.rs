@@ -276,7 +276,15 @@ mod header {
         Other,
     }
 
+    fn repeated_key() -> VaultError {
+        VaultError::Format("the header repeats a key derivation parameter".into())
+    }
+
     /// Parses a KDBX 4 variant dictionary, checking that fixed-size values have their size.
+    ///
+    /// A repeated key is refused outright. KeePassXC never writes one, and parsers disagree on
+    /// which copy counts (the `keepass` crate keeps the last), so a file could otherwise pass
+    /// this check with one value and be derived with another.
     fn variant_dictionary(buf: &[u8]) -> Result<Vec<(String, Value)>, VaultError> {
         if u16::from_le_bytes(buf.get(..2).ok_or_else(damaged)?.try_into().expect("2 bytes")) != 0x0100 {
             return Ok(Vec::new()); // the crate rejects the version itself
@@ -299,7 +307,11 @@ mod header {
                 0x42 => Value::Bytes(value.to_vec()),
                 _ => Value::Other,
             };
-            out.push((String::from_utf8_lossy(key).into_owned(), value));
+            let key = String::from_utf8_lossy(key).into_owned();
+            if out.iter().any(|(k, _)| *k == key) {
+                return Err(repeated_key());
+            }
+            out.push((key, value));
         }
         Ok(out)
     }
@@ -447,6 +459,45 @@ mod header {
             let at = short.windows(1).rposition(|w| w == b"R").unwrap() + 1;
             short[at - 6] = 0x05; // retag the bool as u64 while leaving its 1-byte value
             assert_eq!(check(&short), Err(damaged()));
+        }
+
+        /// The `keepass` crate reads a variant dictionary into a `HashMap`, so of two copies of
+        /// a key the last one wins there. A check that looked at the first copy could be
+        /// passed with a cheap "R" followed by the real, absurd one.
+        #[test]
+        fn refuses_repeated_kdf_parameters() {
+            let uuid = || ("$UUID", Value::Bytes(AES_KDF.to_vec()));
+            let salt = || ("S", Value::Bytes(vec![0; 32]));
+            let twice = kdbx4(&[uuid(), salt(), ("R", Value::U64(1)), ("R", Value::U64(u64::MAX))]);
+            assert_eq!(check(&twice), Err(repeated_key()));
+            // The same for the algorithm itself: AES first, Argon2 with huge memory last.
+            let two_kdfs = kdbx4(&[
+                uuid(),
+                salt(),
+                ("R", Value::U64(1)),
+                ("$UUID", Value::Bytes(ARGON2ID.to_vec())),
+                ("M", Value::U64(1 << 40)),
+                ("I", Value::U64(1)),
+                ("P", Value::U32(1)),
+                ("V", Value::U32(0x13)),
+            ]);
+            assert_eq!(check(&two_kdfs), Err(repeated_key()));
+            // Even a harmless repetition is refused: no real writer produces one.
+            let same = kdbx4(&[uuid(), salt(), ("R", Value::U64(1)), ("R", Value::U64(1))]);
+            assert_eq!(check(&same), Err(repeated_key()));
+            // Public custom data is a variant dictionary too.
+            let mut data = kdbx4(&[uuid(), salt(), ("R", Value::U64(1))]);
+            let end = data.len() - 9; // before the end field (kind 0, len 4, "\r\n\r\n")
+            let mut vd = vec![0x00, 0x01];
+            for _ in 0..2 {
+                vd.extend([0x04, 1, 0, 0, 0, b'k', 4, 0, 0, 0, 1, 0, 0, 0]);
+            }
+            vd.push(0);
+            let mut field = vec![12];
+            field.extend((vd.len() as u32).to_le_bytes());
+            field.extend(vd);
+            data.splice(end..end, field);
+            assert_eq!(check(&data), Err(repeated_key()));
         }
     }
 }
