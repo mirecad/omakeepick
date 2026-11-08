@@ -350,6 +350,104 @@ fn a_lock_during_an_unlock_wins() {
     assert_eq!(conn.state()["entryCount"], 7);
 }
 
+/// The `open-db` helper that `daemon` started, found through /proc.
+fn helper_of(daemon: &Daemon) -> Option<u32> {
+    let parent = daemon.child.id();
+    std::fs::read_dir("/proc").unwrap().flatten().find_map(|entry| {
+        let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+        let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+        // "pid (comm) state ppid ..."; comm may contain spaces, so split after its ')'.
+        let after_comm = &stat[stat.rfind(')')? + 2..];
+        let ppid: u32 = after_comm.split(' ').nth(1)?.parse().ok()?;
+        (ppid == parent).then_some(pid)
+    })
+}
+
+fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn is_alive(pid: u32) -> bool {
+    // A zombie is dead for our purposes: its memory is gone, only the exit status waits.
+    std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| stat[stat.rfind(')')? + 2..].chars().next())
+        .is_some_and(|state| state != 'Z')
+}
+
+/// A key derivation runs in a helper process. A lock, `quit` or the daemon's death kills it at
+/// once; nobody waits for it to finish.
+#[test]
+fn a_lock_kills_a_running_derivation() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    // With OMAKEEPICK_TEST_HOLD_KDF (debug builds), the helper blocks on this FIFO where its
+    // derivation would run. Nothing ever writes to it: a killed helper is the only way out.
+    let fifo = env.dir.path().join("hold-kdf");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let serve = |env: &Env| {
+        let mut serve = env.command(&["serve"]);
+        serve.env("OMAKEEPICK_TEST_HOLD_KDF", &fifo);
+        env.serve_with(serve)
+    };
+    let db = env.db_copy();
+    let start_unlock = |conn: &mut Conn, daemon: &Daemon| {
+        conn.events.clear();
+        let id = conn.send("unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));
+        conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
+        let mut helper = None;
+        wait_until("the helper has started", || {
+            helper = helper_of(daemon);
+            helper.is_some()
+        });
+        let helper = helper.unwrap();
+        // The credentials went to the helper on stdin: not on its command line, which every
+        // process can read, and not in its environment. The helper is non-dumpable like the
+        // daemon, so its environment is not readable at all (except by root).
+        let cmdline = std::fs::read(format!("/proc/{helper}/cmdline")).unwrap();
+        assert_eq!(cmdline, b"omakeepickd\0open-db\0");
+        match std::fs::read(format!("/proc/{helper}/environ")) {
+            Ok(environ) => assert!(!environ.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes())),
+            Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
+        }
+        (id, helper)
+    };
+
+    // A screen lock: the request fails at once and the helper is gone.
+    let daemon = serve(&env);
+    let mut conn = env.connect();
+    let (id, helper) = start_unlock(&mut conn, &daemon);
+    assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
+    let started = Instant::now();
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    assert!(started.elapsed() < Duration::from_secs(5), "the cancel waited for the derivation");
+    wait_until("the helper is dead", || !is_alive(helper));
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
+
+    // `quit` (and so suspend, which locks the same way) does not wait for it either.
+    let (_, helper) = start_unlock(&mut conn, &daemon);
+    assert_eq!(conn.request("quit", json!({}))["ok"], true);
+    let mut daemon = daemon;
+    wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
+    assert!(!is_alive(helper));
+    drop(daemon);
+
+    // The daemon dying takes the helper with it (PR_SET_PDEATHSIG).
+    let daemon = serve(&env);
+    let mut conn = env.connect();
+    let (_, helper) = start_unlock(&mut conn, &daemon);
+    unsafe { libc::kill(daemon.child.id() as i32, libc::SIGKILL) };
+    wait_until("the helper is dead", || !is_alive(helper));
+}
+
 #[test]
 fn reloads_when_the_file_changes() {
     let env = Env::new();

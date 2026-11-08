@@ -8,6 +8,7 @@ pub mod config;
 pub mod daemon;
 pub mod harden;
 pub mod locker;
+pub mod opener;
 pub mod paths;
 pub mod portal;
 pub mod protocol;

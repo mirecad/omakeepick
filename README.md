@@ -118,7 +118,7 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
 - After 3 wrong PINs, after suspend or hibernate, or after *Close database*, the PIN no longer
   works and you need the master password.
 - A lock always wins. If the screen locks or the machine suspends while an unlock is still
-  running, that unlock is discarded and the database stays locked. Auto-type in progress stops,
+  running, that unlock is stopped and the database stays locked. Auto-type in progress stops,
   and a value copied at that moment is cleared. Before suspend, the daemon holds the system
   back for a few seconds at most until this is done.
 
@@ -185,12 +185,13 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     can't `ptrace` it or read its memory.
   - Its memory is not pinned, so while unlocked the kernel may swap it. Locking, including the
     automatic lock before suspend or hibernate, wipes the decrypted database first.
-  - Before suspend, the daemon also waits for an unlock that is still deriving its key, for as
-    long as logind allows (`InhibitDelayMaxSec` in `/etc/systemd/logind.conf`, 5 s by default,
-    15 s on Omarchy). A key derivation can't be interrupted, so if yours takes longer than that
-    and the machine hibernates at that moment, the credentials of that one unlock are in the
-    hibernation image. Raise the limit, or shorten the derivation in KeePassXC, if that matters
-    to you. On Omarchy the swap, and so the image, is inside the encrypted disk.
+  - The key derivation runs in a helper process (`omakeepickd open-db`, a second copy of the
+    same binary, hardened the same way). The master password and key file go to it on a pipe,
+    and the decrypted database comes back on one. A lock, suspend or exit while it is still
+    deriving kills it with `SIGKILL`, and the daemon waits until it is gone before it lets the
+    system sleep, so an unlock that was in flight when the machine hibernates leaves nothing in
+    the image. The helper dies with the daemon too, and a parser crash on a malformed file
+    takes down the helper, not the daemon.
 - **The prebuilt helper is pinned.** Each commit of the plugin names the SHA-256 of the one
   release binary it installs (`bin/omakeepickd.sha256`), so a release file swapped later is
   refused. From 0.1.1 on, release binaries also carry a GitHub build attestation, and
@@ -205,8 +206,8 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
   as strong as this process's memory isolation. If that worries you, don't set one.
 - **What "locked" means.** Locking drops the decrypted database, the key material and the
   clipboard value. Live secrets are wiped where the code holds them; memory that the parser
-  library freed on its own is not scrubbed, which on Omarchy matters little because swap, and
-  so a hibernation image, is inside the encrypted disk.
+  library freed on its own while the database was open is not scrubbed, which on Omarchy
+  matters little because swap, and so a hibernation image, is inside the encrypted disk.
 - **Not stored anywhere:** passwords or PINs. `~/.local/state/omakeepick/state.json` holds
   only the last database and key-file paths, plus per-entry use counts (by UUID) for ranking.
 

@@ -1,7 +1,8 @@
 //! Automatic locking: idle timeout, suspend/hibernate and logind session lock.
 //!
-//! Before sleep the database is locked and the quick-unlock key wiped while holding a logind
-//! "delay" inhibitor, so nothing decrypted is left in RAM (or in the hibernation image).
+//! Before sleep the database is locked, the quick-unlock key wiped and any running key
+//! derivation killed, all while holding a logind "delay" inhibitor, so nothing decrypted is left
+//! in RAM (or in the hibernation image).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,8 +45,9 @@ trait Manager {
     fn inhibit_delay_max_usec(&self) -> zbus::Result<u64>;
 }
 
-/// How long to wait for in-flight work before releasing the inhibitor: all the time logind
-/// gives us, minus a margin for the release itself. logind sleeps anyway once that is up.
+/// How long to wait for in-flight work (a copy or auto-type still running; a derivation is
+/// killed, not waited for) before releasing the inhibitor: all the time logind gives us, minus a
+/// margin for the release itself. logind sleeps anyway once that is up.
 async fn settle_limit(manager: &ManagerProxy<'_>) -> Duration {
     match manager.inhibit_delay_max_usec().await {
         Ok(usec) => Duration::from_micros(usec)
@@ -111,10 +113,9 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
     while let Some(signal) = sleeps.next().await {
         let Ok(args) = signal.args() else { continue };
         if args.start {
-            // The database is wiped at once; then wait for the clipboard clear and for any
-            // unlock, reload or action still holding secrets, so they finish (and are
-            // discarded) before the inhibitor is released. A key derivation cannot be
-            // interrupted, so this uses all the time logind allows.
+            // The database is wiped at once and a running derivation killed; then wait for
+            // the clipboard clear and for any copy or auto-type still holding secrets, so they
+            // finish (and are discarded) before the inhibitor is released.
             daemon.lock_and_settle(LockReason::Sleep, settle_limit(&manager).await).await;
             // Releasing the inhibitor lets the system go to sleep.
             inhibitor = None;

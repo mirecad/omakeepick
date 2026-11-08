@@ -11,6 +11,7 @@ usage:
   omakeepickd ctl <cmd> [json] send one request and print the reply
   omakeepickd pick-file db|keyfile [folder]
                                show the file dialog and print the chosen path
+  omakeepickd open-db          (internal) decrypt a database for the daemon
   omakeepickd --version";
 
 fn main() -> ExitCode {
@@ -22,6 +23,7 @@ fn main() -> ExitCode {
         Some("attach") => omakeepickd::client::attach(),
         Some("ctl") => omakeepickd::client::ctl(&args[1..]),
         Some("pick-file") => omakeepickd::portal::pick_file_main(&raw[1..]),
+        Some("open-db") => omakeepickd::opener::open_db_main(),
         Some("--version" | "-V") => {
             println!("omakeepickd {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS

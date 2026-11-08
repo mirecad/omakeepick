@@ -45,9 +45,8 @@ pub fn run(detach: bool) -> std::process::ExitCode {
         }
     };
     let outcome = runtime.block_on(serve());
-    // Dropping the runtime would wait forever for a blocking task that cannot finish (a key
-    // derivation that was given absurd parameters); abandon it instead so the process exits
-    // and releases the instance lock.
+    // Dropping the runtime would wait for every blocking task; abandon anything still running
+    // so the process exits and releases the instance lock.
     runtime.shutdown_timeout(Duration::from_secs(1));
     match outcome {
         Ok(()) => std::process::ExitCode::SUCCESS,

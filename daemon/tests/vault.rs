@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use keepass::config::{DatabaseVersion, InnerCipherConfig, KdfConfig, OuterCipherConfig};
 use keepass::{Database, DatabaseKey};
 use omakeepickd::autotype::{self, Fields, Token};
+use omakeepickd::opener::Opener;
 use omakeepickd::totp;
 use omakeepickd::vault::{self, KeyMaterial, OpenDb, VaultError};
 use zeroize::Zeroizing;
 
+const BIN: &str = env!("CARGO_BIN_EXE_omakeepickd");
 const PASSWORD: &str = "test-password";
 
 fn fixture(name: &str) -> PathBuf {
@@ -165,4 +167,78 @@ fn totp_from_all_three_formats() {
     }
     let gitea = open.entry(&uuid("Gitea home server")).unwrap();
     assert!(totp::current_code(&gitea).is_err());
+}
+
+/// Opens `path` the way the daemon does: in an `open-db` helper process.
+async fn open_in_helper(path: &Path, key: &KeyMaterial) -> Result<Database, VaultError> {
+    Opener::spawn(Path::new(BIN), path, key).await?.wait().await
+}
+
+/// Everything in the database except the file-level settings the hand-over rewrites.
+fn contents(db: &Database) -> serde_json::Value {
+    let mut value = serde_json::to_value(db).unwrap();
+    value.as_object_mut().unwrap().remove("config").expect("the crate serializes the config");
+    value
+}
+
+/// The helper hands the database over re-encrypted; nothing may be lost or changed on the way.
+#[tokio::test]
+async fn the_helper_hands_over_the_same_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let argon2id = kdbx4_copy(
+        dir.path(),
+        "argon2id.kdbx",
+        KdfConfig::Argon2id {
+            iterations: 2,
+            memory: 16 * 1024 * 1024,
+            parallelism: 2,
+            version: rust_argon2::Version::Version13,
+        },
+        OuterCipherConfig::ChaCha20,
+    );
+    let cases = [
+        (fixture("password.kdbx"), key(PASSWORD, None)),
+        (fixture("password-keyfile.kdbx"), key(PASSWORD, Some("password-keyfile.keyx"))),
+        (fixture("keyfile-only.kdbx"), key("", Some("raw.key"))),
+        (argon2id, key(PASSWORD, None)),
+    ];
+    for (path, key) in cases {
+        let direct = vault::open_database(&path, &key).unwrap();
+        let handed_over =
+            open_in_helper(&path, &key).await.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(contents(&direct), contents(&handed_over), "{}", path.display());
+        // And the daemon's view of it, which is what matters.
+        let direct = OpenDb::new(path.clone(), None, key.clone(), None, direct);
+        let handed_over = OpenDb::new(path.clone(), None, key, None, handed_over);
+        assert_eq!(direct.index.len(), 7, "{}", path.display());
+        for (a, b) in direct.index.iter().zip(&handed_over.index) {
+            assert_eq!(
+                (&a.uuid, &a.title, &a.username, &a.url, &a.group, &a.tags, &*a.notes),
+                (&b.uuid, &b.title, &b.username, &b.url, &b.group, &b.tags, &*b.notes)
+            );
+            assert_eq!((a.has_password, a.has_totp, a.autotype), (b.has_password, b.has_totp, b.autotype));
+            let (ea, eb) = (direct.entry(&a.uuid).unwrap(), handed_over.entry(&b.uuid).unwrap());
+            assert_eq!(ea.get_password(), eb.get_password(), "{}", a.title);
+            assert_eq!(
+                vault::autotype_sequence(&direct.db, &ea, "{PASSWORD}"),
+                vault::autotype_sequence(&handed_over.db, &eb, "{PASSWORD}")
+            );
+            if a.has_totp {
+                assert_eq!(totp::current_code(&ea).unwrap().0, totp::current_code(&eb).unwrap().0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_helper_reports_errors_like_the_in_process_open() {
+    let bad = key("nope", None);
+    assert_eq!(open_in_helper(&fixture("password.kdbx"), &bad).await.err(), Some(VaultError::BadCredentials));
+    let missing = open_in_helper(&fixture("missing.kdbx"), &key(PASSWORD, None)).await;
+    assert!(matches!(missing, Err(VaultError::NotFound(_))), "{missing:?}");
+    let xml = open_in_helper(&fixture("fixture.xml"), &key(PASSWORD, None)).await;
+    assert!(matches!(xml, Err(VaultError::Format(_))), "{xml:?}");
+    // A helper that is not the daemon's binary cannot be started.
+    let spawn = Opener::spawn(Path::new("/nonexistent/omakeepickd"), &fixture("password.kdbx"), &bad).await;
+    assert!(matches!(spawn, Err(VaultError::Io(_))));
 }

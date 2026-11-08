@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use keepass::Database;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast, mpsc};
@@ -14,6 +15,7 @@ use zeroize::Zeroizing;
 use crate::autotype::{self, Fields, PasteTypist, Wtype};
 use crate::clipboard::Clipboard;
 use crate::config::Settings;
+use crate::opener::Opener;
 use crate::protocol::{ApiError, Reply, args, ok, ok_with};
 use crate::quickunlock::{self, QuickBlob};
 use crate::search::Searcher;
@@ -72,6 +74,9 @@ pub struct Core {
     /// Bumped by every lock. An unlock captures it when it starts and its result is installed
     /// only if it is unchanged, so a lock, close or suspend during an unlock always wins.
     epoch: u64,
+    /// Publishes `epoch`, so a running unlock or reload can stop (and kill its helper) the
+    /// moment a lock happens instead of finishing first.
+    epoch_tx: tokio::sync::watch::Sender<u64>,
     /// The epoch of the last lock that wiped quick unlock. A quick unlock that started before
     /// it must not put its PIN key back.
     wiped_at: u64,
@@ -82,17 +87,19 @@ pub struct Core {
     watcher: Option<watch::Watcher>,
 }
 
-/// A key derivation that runs longer than this is abandoned (its thread finishes on its own and
-/// the result is dropped). Legitimate derivations take a second or two; the header check in
-/// `vault` already refuses absurd parameters, so this is the backstop.
+/// A key derivation that runs longer than this is killed. Legitimate derivations take a second
+/// or two; the header check in `vault` already refuses absurd parameters, so this is the
+/// backstop.
 const KDF_TIMEOUT: Duration = Duration::from_secs(120);
 const TOOK_TOO_LONG: &str = "Opening the database took too long and was abandoned";
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_ATOMS: usize = 16;
 
-/// Test hook: with `OMAKEEPICK_TEST_HOLD` set to a FIFO, an unlock blocks there until the test
-/// writes to it, so a lock can be sent while the unlock is in flight. Debug builds only.
+/// Test hook: with `OMAKEEPICK_TEST_HOLD` set to a FIFO, an unlock blocks there (before the
+/// PIN check, before the helper starts) until the test writes to it, so a lock can be sent
+/// while the unlock is in flight. Debug builds only. `opener` has the matching hook for the
+/// derivation itself.
 fn test_hold() {
     #[cfg(debug_assertions)]
     if let Some(fifo) = std::env::var_os("OMAKEEPICK_TEST_HOLD") {
@@ -165,6 +172,7 @@ impl Core {
     fn lock(&mut self, reason: LockReason) -> bool {
         self.watcher = None;
         self.epoch += 1;
+        self.epoch_tx.send_replace(self.epoch);
         if reason.wipes_quick_unlock() {
             self.wiped_at = self.epoch;
         }
@@ -284,6 +292,19 @@ enum Prepared {
     Type { tokens: Vec<autotype::Token> },
 }
 
+/// Why an open did not produce a database.
+enum OpenError {
+    /// A lock happened while it ran; the helper was killed.
+    Cancelled,
+    Vault(VaultError),
+}
+
+impl From<VaultError> for OpenError {
+    fn from(err: VaultError) -> Self {
+        OpenError::Vault(err)
+    }
+}
+
 pub struct Daemon {
     core: Mutex<Core>,
     events: broadcast::Sender<String>,
@@ -327,6 +348,7 @@ impl Daemon {
                 locked: None,
                 busy: false,
                 epoch: 0,
+                epoch_tx: tokio::sync::watch::channel(0).0,
                 wiped_at: 0,
                 lock_reason: None,
                 last_activity: Instant::now(),
@@ -417,15 +439,37 @@ impl Daemon {
             }
         };
         if tokio::time::timeout_at(deadline.into(), settle).await.is_err() {
-            // Nothing more can be done: a key derivation cannot be interrupted, and logind
-            // sleeps once its delay limit is up. The request's result is still discarded.
+            // A derivation is killed by the lock, so this is a copy or auto-type that `wl-copy`
+            // or `wtype` is still busy with. Its result is discarded either way.
             eprintln!(
-                "omakeepickd: {} request(s) still held secrets {:.1}s after locking (raise \
-                 InhibitDelayMaxSec in logind.conf if your key derivation is slow)",
+                "omakeepickd: {} request(s) still held secrets {:.1}s after locking",
                 self.inflight.load(Ordering::SeqCst),
                 limit.as_secs_f64()
             );
         }
+    }
+
+    /// Resolves once a lock has happened since `epoch`.
+    async fn locked_since(&self, epoch: u64) {
+        let mut epochs = self.core().epoch_tx.subscribe();
+        if epochs.wait_for(|e| *e != epoch).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    /// Decrypts `path` with `key` in a helper process (see `opener`). A lock since `epoch`, or
+    /// the timeout, kills the helper and waits for it to be gone before returning.
+    async fn open_database(&self, path: &Path, key: &KeyMaterial, epoch: u64) -> Result<Database, OpenError> {
+        // /proc/self/exe rather than a path: the binary may have been replaced since we started,
+        // and the helper must speak this daemon's protocol.
+        let mut opener = Opener::spawn(Path::new("/proc/self/exe"), path, key).await?;
+        let outcome = tokio::select! {
+            result = opener.wait() => return result.map_err(OpenError::Vault),
+            () = self.locked_since(epoch) => OpenError::Cancelled,
+            () = tokio::time::sleep(KDF_TIMEOUT) => OpenError::Vault(VaultError::Io(TOOK_TOO_LONG.into())),
+        };
+        opener.abort().await;
+        Err(outcome)
     }
 
     /// Commands answered immediately, in request order.
@@ -585,22 +629,32 @@ impl Daemon {
         let epoch = self.begin_busy()?;
         let _inflight = Inflight::new(self);
         let password = a.password;
-        let (p, k) = (path.clone(), keyfile.clone());
-        let worker = tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
+        let k = keyfile.clone();
+        let key = tokio::task::spawn_blocking(move || -> Result<KeyMaterial, VaultError> {
             test_hold();
             let keyfile_bytes = k.as_deref().map(vault::read_keyfile).transpose()?;
-            let key = KeyMaterial::new(password, keyfile_bytes)?;
-            let db = vault::open_database(&p, &key)?;
-            let quick = pin
-                .map(|pin| QuickBlob::seal(&pin, &key, p.as_os_str().as_bytes()))
-                .transpose()
-                .map_err(VaultError::Io)?;
-            Ok(OpenDb::new(p, k, key, quick, db))
-        });
-        let result = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
-            Ok(joined) => joined.unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}")))),
-            // The worker keeps running on its thread, but its result is never installed.
-            Err(_) => Err(VaultError::Io(TOOK_TOO_LONG.into())),
+            KeyMaterial::new(password, keyfile_bytes)
+        })
+        .await
+        .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))));
+        let result = match key {
+            Ok(key) => match self.open_database(&path, &key, epoch).await {
+                Ok(db) => {
+                    let (p, k) = (path.clone(), keyfile);
+                    tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
+                        let quick = pin
+                            .map(|pin| QuickBlob::seal(&pin, &key, p.as_os_str().as_bytes()))
+                            .transpose()
+                            .map_err(VaultError::Io)?;
+                        Ok(OpenDb::new(p, k, key, quick, db))
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))))
+                    .map_err(OpenError::Vault)
+                }
+                Err(e) => Err(e),
+            },
+            Err(e) => Err(OpenError::Vault(e)),
         };
         match result {
             Ok(open) => {
@@ -613,7 +667,12 @@ impl Daemon {
                 eprintln!("omakeepickd: unlocked {} ({count} entries)", path.display());
                 ok()
             }
-            Err(err) => {
+            Err(OpenError::Cancelled) => {
+                self.core().busy = false;
+                self.emit_state();
+                Err(Self::cancelled())
+            }
+            Err(OpenError::Vault(err)) => {
                 self.core().busy = false;
                 self.emit_state();
                 Err(err.into())
@@ -640,21 +699,14 @@ impl Daemon {
         let _inflight = Inflight::new(self);
         self.emit_state();
         let p = path.clone();
+        // The PIN check is a fixed-cost Argon2id of our own; the database's derivation, whose
+        // cost the file dictates, runs in the helper.
         let worker = tokio::task::spawn_blocking(move || {
             test_hold();
-            // Read first, check the PIN second: a read error is reported only for a right PIN,
-            // and a wrong one costs a try either way.
-            let data = vault::read_database(&p);
             let key = blob.open(&a.pin, p.as_os_str().as_bytes());
-            let opened =
-                key.map(|key| data.and_then(|data| vault::parse_database(&data, &key)).map(|db| (key, db)));
-            (blob, opened)
+            (blob, key)
         });
-        let outcome = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
-            Ok(joined) => joined.map_err(|e| e.to_string()),
-            Err(_) => Err(TOOK_TOO_LONG.into()),
-        };
-        let (blob, opened) = match outcome {
+        let (blob, key) = match worker.await {
             Ok(v) => v,
             Err(e) => {
                 // The blob was lost with the task; fall back to a full unlock.
@@ -662,6 +714,10 @@ impl Daemon {
                 self.emit_state();
                 return Err(ApiError::new("failed", format!("Quick unlock failed: {e}")));
             }
+        };
+        let opened = match key {
+            Some(key) => Some(self.open_database(&path, &key, epoch).await.map(|db| (key, db))),
+            None => None,
         };
         match opened {
             Some(Ok((key, db))) => {
@@ -680,7 +736,16 @@ impl Daemon {
                 self.emit_state();
                 ok()
             }
-            Some(Err(err)) => {
+            Some(Err(OpenError::Cancelled)) => {
+                // Locked while the helper ran, which killed it. Same rule as a rejected install.
+                let mut core = self.core();
+                core.busy = false;
+                core.restore_quick(blob, epoch);
+                drop(core);
+                self.emit_state();
+                Err(Self::cancelled())
+            }
+            Some(Err(OpenError::Vault(err))) => {
                 let mut core = self.core();
                 core.busy = false;
                 // A file that could not be read (mid-save, unmounted) keeps the PIN key, a file
@@ -871,13 +936,9 @@ impl Daemon {
             if attempt > 0 {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
             }
-            let (p, k) = (path.clone(), key.clone());
-            let worker = tokio::task::spawn_blocking(move || vault::open_database(&p, &k));
-            let result = match tokio::time::timeout(KDF_TIMEOUT, worker).await {
-                Ok(joined) => joined.unwrap_or_else(|e| Err(VaultError::Io(e.to_string()))),
-                Err(_) => Err(VaultError::Io(TOOK_TOO_LONG.into())),
-            };
-            match result {
+            match self.open_database(&path, &key, epoch).await {
+                // Locked meanwhile: the helper was killed, and this copy would be stale anyway.
+                Err(OpenError::Cancelled) => return,
                 Ok(db) => {
                     let mut core = self.core();
                     // Locked meanwhile: this copy is stale even if the same file was unlocked again.
@@ -893,7 +954,7 @@ impl Daemon {
                     self.emit_state();
                     return;
                 }
-                Err(e) => last_error = Some(e),
+                Err(OpenError::Vault(e)) => last_error = Some(e),
             }
         }
         if let Some(e) = last_error {

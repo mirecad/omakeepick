@@ -18,7 +18,7 @@ chrono = "0.4"
 futures-util = { version = "0.3", default-features = false }
 getrandom = "0.3"
 hmac = "0.12"
-keepass = "0.17"
+keepass = { version = "0.17", features = ["save_kdbx4"] }
 libc = "0.2"
 notify = { version = "8", default-features = false }
 nucleo-matcher = "0.3"
@@ -31,7 +31,7 @@ zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] 
 zeroize = { version = "1", features = ["derive", "serde"] }
 
 [dev-dependencies]
-keepass = { version = "0.17", features = ["save_kdbx4"] }
+keepass = { version = "0.17", features = ["save_kdbx4", "serialization"] }
 rust_argon2 = { package = "rust-argon2", version = "3" }
 tempfile = "3"
 
