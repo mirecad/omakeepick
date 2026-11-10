@@ -387,6 +387,10 @@ const BURST_MILLIS: u64 = 500;
 /// How much longer than its work should take a `wtype` may run once nobody waits for it.
 const GRACE: Duration = Duration::from_millis(500);
 
+/// How much longer than its work should take a `wtype` is waited for. One that has not ended
+/// by then is waiting on the compositor, and whoever waits on it has a value in hand.
+const PATIENCE: Duration = Duration::from_secs(5);
+
 fn typing_time(keys: u64, key_delay: u64) -> Duration {
     Duration::from_millis(keys * (key_delay + KEY_MILLIS))
 }
@@ -415,12 +419,14 @@ impl Wtype {
 
     /// Runs `wtype` with arguments only: modifier and key names, and the character of a chord.
     async fn press(&self, args: &[String], keys: u32) -> Result<(), String> {
-        finish(self.start(args, Stdio::null(), typing_time(u64::from(keys), 0))?).await
+        let work = typing_time(u64::from(keys), 0);
+        finish(self.start(args, Stdio::null(), work)?, work).await
     }
 }
 
-/// Waits for `wtype` to end. A failure is reported with what it printed.
-async fn finish(mut tool: Tool) -> Result<(), String> {
+/// Waits for a `wtype` that has `work` to do to end. A failure is reported with what it
+/// printed.
+async fn finish(mut tool: Tool, work: Duration) -> Result<(), String> {
     let mut stderr = tool.stderr();
     let mut message = Vec::new();
     let read = async {
@@ -428,7 +434,11 @@ async fn finish(mut tool: Tool) -> Result<(), String> {
             let _ = stderr.read_to_end(&mut message).await;
         }
     };
-    let (status, ()) = tokio::join!(tool.wait(), read);
+    let ended = async { tokio::join!(tool.wait(), read).0 };
+    let Ok(status) = tokio::time::timeout(work + PATIENCE, ended).await else {
+        // Dropped here, it is given its grace and then killed.
+        return Err("wtype did not finish".into());
+    };
     if !status.map_err(|e| format!("wtype: {e}"))?.success() {
         return Err(format!("wtype failed: {}", String::from_utf8_lossy(&message).trim()));
     }
@@ -444,12 +454,19 @@ impl Typist for Wtype {
 
     async fn text(&mut self, text: &str, key_delay: u64) -> Result<(), String> {
         let work = typing_time(text.chars().count() as u64, key_delay);
-        let mut tool = self.start(&["-d".into(), key_delay.to_string(), "-".into()], Stdio::piped(), work)?;
+        // wtype refuses a delay of 0; without the option it does not wait between keys. The
+        // `-` comes last: wtype types whatever follows it as text.
+        let mut args = Vec::new();
+        if key_delay > 0 {
+            args.extend(["-d".to_string(), key_delay.to_string()]);
+        }
+        args.push("-".to_string());
+        let mut tool = self.start(&args, Stdio::piped(), work)?;
         let mut stdin = tool.stdin().expect("piped stdin");
         let written = stdin.write_all(text.as_bytes()).await;
         drop(stdin);
         // A wtype that could not be written to has ended; `finish` says why.
-        finish(tool).await?;
+        finish(tool, work).await?;
         written.map_err(|e| format!("wtype: {e}"))
     }
 

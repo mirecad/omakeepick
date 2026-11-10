@@ -187,6 +187,8 @@ impl Core {
     /// result would otherwise reopen the database after this lock.
     fn lock(&mut self, reason: LockReason) -> bool {
         self.watcher = None;
+        // With whatever its scratch memory still had of the texts it last matched.
+        self.searcher = Searcher::default();
         self.epoch += 1;
         self.epoch_tx.send_replace(self.epoch);
         if reason.wipes_quick_unlock() {
@@ -486,15 +488,15 @@ impl Daemon {
     /// killed, or told to stop, and are not reaped yet.
     pub async fn lock_and_settle(self: &Arc<Self>, reason: LockReason, limit: Duration) {
         self.lock(reason);
-        let patience = limit.saturating_sub(LAST_MOMENT);
-        if tokio::time::timeout(patience, self.inflight.settled()).await.is_ok() {
+        let last_moment = LAST_MOMENT.min(limit);
+        if tokio::time::timeout(limit - last_moment, self.inflight.settled()).await.is_ok() {
             return;
         }
         // A `wtype` that is still typing the burst it had is killed now rather than left to
         // finish, and the search for a copied value that a clipboard manager took over is
         // given up.
         self.inflight.hurry();
-        if tokio::time::timeout(LAST_MOMENT, self.inflight.settled()).await.is_err() {
+        if tokio::time::timeout(last_moment, self.inflight.settled()).await.is_err() {
             // Two things can be left here, and neither answers to a lock or to a signal: work
             // of our own that is still on a thread, of a size this code sets and no file or
             // sequence can stretch (the PIN's Argon2id, taking a hand-over apart), and a
@@ -1234,15 +1236,14 @@ impl Daemon {
 }
 
 async fn focused_is_xwayland() -> bool {
-    let Ok(out) = tokio::process::Command::new("hyprctl")
+    let asked = tokio::process::Command::new("hyprctl")
         .args(["activewindow", "-j"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        // An action dropped while this is asked (a lock) takes it along.
+        // An action dropped while this is asked (a lock), or tired of waiting, takes it along.
         .kill_on_drop(true)
-        .output()
-        .await
-    else {
+        .output();
+    let Ok(Ok(out)) = tokio::time::timeout(Duration::from_secs(2), asked).await else {
         return false;
     };
     serde_json::from_slice::<Value>(&out.stdout)

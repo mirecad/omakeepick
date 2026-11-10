@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::vault::IndexedEntry;
 
@@ -38,9 +39,19 @@ pub fn frecency(usage: Option<&(u32, i64)>, now: i64) -> u32 {
     (f64::from(count).ln_1p() * 120.0 * 0.5f64.powf(age_days / 30.0)) as u32
 }
 
+/// A `Searcher` holds no entry text between searches. `buf` is where nucleo wants a text that
+/// is not plain ASCII spelled out, a note as much as a title: it is wiped after every search.
+/// The matcher has scratch memory of its own, which cannot be reached from here; it sees the
+/// fields that are matched fuzzily (never the notes), and a lock replaces the whole `Searcher`.
 pub struct Searcher {
     matcher: Matcher,
     buf: Vec<char>,
+}
+
+impl Drop for Searcher {
+    fn drop(&mut self) {
+        self.buf.zeroize();
+    }
 }
 
 impl Default for Searcher {
@@ -62,8 +73,8 @@ impl Searcher {
         let haystack = if haystack.is_ascii() {
             haystack
         } else {
-            folded = haystack.to_lowercase();
-            &folded
+            folded = Zeroizing::new(haystack.to_lowercase());
+            folded.as_str()
         };
         atom.score(Utf32Str::new(haystack, &mut self.buf), &mut self.matcher).map(u32::from)
     }
@@ -99,6 +110,28 @@ impl Searcher {
 
     /// Returns indices into `index`, best first, and the number of matches before `limit`.
     pub fn search(
+        &mut self,
+        index: &[IndexedEntry],
+        query: &str,
+        usage: &Usage,
+        limit: usize,
+        recent: usize,
+        now: i64,
+    ) -> (Vec<usize>, usize) {
+        // Room for the longest text there is, taken while `buf` is empty: it then never grows
+        // with a text in it, which would leave a copy of that text behind in freed memory.
+        let longest = index
+            .iter()
+            .flat_map(|e| [&e.title, &e.username, &e.url_match, &e.group, &e.tags, &*e.notes])
+            .map(String::len)
+            .max();
+        self.buf.reserve(longest.unwrap_or(0));
+        let found = self.find(index, query, usage, limit, recent, now);
+        self.buf.zeroize();
+        found
+    }
+
+    fn find(
         &mut self,
         index: &[IndexedEntry],
         query: &str,
@@ -173,6 +206,22 @@ mod tests {
         let index = index();
         let (hits, _) = Searcher::default().search(&index, query, usage, 50, 8, 1_000_000);
         hits.into_iter().map(|i| index[i].title.clone()).collect()
+    }
+
+    /// A search leaves none of the texts it went through in the `Searcher`: not the note it
+    /// found, and not in the room `buf` keeps for the next search either.
+    #[test]
+    fn nothing_of_the_texts_is_kept_after_a_search() {
+        let note = "tajná poznámka: ľščťžýáíé";
+        let index = vec![entry("Žilina", "", "", "", note)];
+        let mut searcher = Searcher::default();
+        let (hits, _) = searcher.search(&index, "poznamka", &Usage::new(), 10, 0, 0);
+        assert_eq!(hits, [0]);
+        assert!(searcher.buf.is_empty());
+        assert!(searcher.buf.capacity() >= note.chars().count());
+        // SAFETY: `Vec::zeroize` has written zeroes over all of the capacity.
+        let room = searcher.buf.spare_capacity_mut();
+        assert!(room.iter().all(|c| unsafe { c.as_ptr().cast::<u32>().read() } == 0));
     }
 
     #[test]

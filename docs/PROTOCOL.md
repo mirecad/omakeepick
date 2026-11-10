@@ -151,7 +151,7 @@ Never contains secrets: no password, notes, custom field values or TOTP secret.
 |---|---|
 | `autotype` | waits `autotypeStartDelayMs` (so the overlay can hide and focus return), then types the entry's auto-type sequence into the focused window |
 | `typePassword` | same, but types only `{PASSWORD}` |
-| `copyUsername`, `copyPassword`, `copyUrl`, `copyTotp` | copies the value with a `wl-copy --foreground --sensitive` that the daemon keeps as its child, and kills it after `clipboardClearSeconds`, or on a lock, unless something else was copied by then (which ends it anyway) |
+| `copyUsername`, `copyPassword`, `copyUrl`, `copyTotp` | copies the value with a `wl-copy --foreground --sensitive` that the daemon keeps as its child, and kills it after `clipboardClearSeconds`, or on a lock, unless something else was copied by then (which ends it anyway). Fails with `tool_missing` if wl-clipboard is older than 2.3 |
 
 The client must hide the overlay **before** sending `autotype` / `typePassword`.
 

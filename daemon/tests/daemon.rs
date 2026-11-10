@@ -871,6 +871,11 @@ impl Inhibitor {
 impl FakeLogind {
     /// `None` if `dbus-daemon` is not installed.
     fn start(dir: &Path) -> Option<FakeLogind> {
+        FakeLogind::patient_for(dir, Duration::from_secs(3))
+    }
+
+    /// One that says it waits `delay_max` for inhibitors (`InhibitDelayMaxSec`).
+    fn patient_for(dir: &Path, delay_max: Duration) -> Option<FakeLogind> {
         let (bus, address) = start_bus(dir, "system-bus")?;
         let (ready, started) = mpsc::channel();
         let (taken, inhibitors) = mpsc::channel();
@@ -879,7 +884,8 @@ impl FakeLogind {
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
             // Also ends, with an error, when the bus goes away at the end of the test.
-            if let Err(e) = runtime.block_on(serve_logind(&bus_address, ready, taken, announcements)) {
+            let served = serve_logind(&bus_address, delay_max, ready, taken, announcements);
+            if let Err(e) = runtime.block_on(served) {
                 eprintln!("fake logind: {e}");
             }
         });
@@ -915,6 +921,7 @@ impl Drop for FakeLogind {
 
 async fn serve_logind(
     address: &str,
+    delay_max: Duration,
     ready: mpsc::Sender<()>,
     taken: mpsc::Sender<std::io::PipeReader>,
     mut announcements: tokio::sync::mpsc::UnboundedReceiver<bool>,
@@ -924,7 +931,7 @@ async fn serve_logind(
     conn.request_name("org.freedesktop.login1").await?;
     ready.send(()).unwrap();
     // `InhibitDelayMaxSec`: how long the real logind would wait for the inhibitor.
-    let delay_max = || Variant::from(3_000_000u64);
+    let delay_max = || Variant::from(delay_max.as_micros() as u64);
     loop {
         tokio::select! {
             start = announcements.recv() => {
@@ -1040,6 +1047,15 @@ fn a_sleep_waits_for_what_is_still_in_flight() {
     assert_eq!(state["quickUnlock"], false);
 }
 
+/// Waits until an auto-type of `{USERNAME}{DELAY 10000}{PASSWORD}` for the Jira entry is in its
+/// pause: the user name is typed, the `wtype` that typed it has ended, and the moment the
+/// daemon takes between two of them has passed.
+fn in_the_pause(daemon: &Daemon, fake: &Fake) {
+    wait_until("the user name is typed", || fake.read("typed") == "madev@work");
+    wait_until("wtype has ended", || helper_of(daemon).is_none());
+    std::thread::sleep(Duration::from_millis(100));
+}
+
 /// A lock ends an auto-type wherever it is, and what the action has in hand at that point is
 /// as little as it can be: nothing in a pause, since a field's value is taken from the database
 /// only when it is typed, and otherwise the value being typed, which goes with the action.
@@ -1060,7 +1076,7 @@ fn a_lock_ends_an_auto_type_wherever_it_is() {
     // In a pause, which nothing but the lock ends for ten seconds.
     configure(&mut conn, sequence("{USERNAME}{DELAY 10000}{PASSWORD}", 0));
     let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
-    wait_until("the user name is typed", || fake.read("typed") == "madev@work");
+    in_the_pause(&daemon, &fake);
     let locked = Instant::now();
     assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
     assert_eq!(conn.reply(id)["error"], "cancelled");
@@ -1121,7 +1137,7 @@ fn a_sleep_is_not_held_back_by_an_action() {
         json!({"autotypeSequence": "{USERNAME}{DELAY 10000}{PASSWORD}", "autotypeStartDelayMs": 50}),
     );
     let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
-    wait_until("the user name is typed", || fake.read("typed") == "madev@work");
+    in_the_pause(&daemon, &fake);
     asleep_within(&inhibitor, "the pause");
     assert_eq!(conn.reply(id)["error"], "cancelled");
     assert_eq!(fake.read("typed"), "madev@work");
@@ -1130,12 +1146,48 @@ fn a_sleep_is_not_held_back_by_an_action() {
     let inhibitor = logind.next_inhibitor();
     assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
     let id = conn.send("act", json!({"entry": jira, "action": "copyPassword"}));
-    wait_until("wl-copy is running", || helper_of(&daemon).is_some());
+    wait_until("wl-copy is running", || fake.read("wl-copy.log").contains("stalled"));
+    assert!(helper_of(&daemon).is_some());
     asleep_within(&inhibitor, "wl-copy");
     assert_eq!(conn.reply(id)["error"], "cancelled");
     // It was killed, with the password it was never going to take still in its pipe.
     assert_eq!(helper_of(&daemon), None);
     assert_eq!(fake.selection("clipboard"), None);
+}
+
+/// When logind's time is nearly up, a `wtype` that is still at it is killed rather than left to
+/// finish: here one that never finishes, with keys set so slow that its own allowance (the time
+/// a key takes, and half a second) is longer than the second this logind waits.
+#[test]
+fn a_sleep_that_can_wait_no_longer_kills_what_is_left() {
+    let env = Env::new();
+    let Some(logind) = FakeLogind::patient_for(env.dir.path(), Duration::from_millis(1500)) else {
+        eprintln!("skipped: dbus-daemon is not installed");
+        return;
+    };
+    let mut fake = None;
+    let daemon = logind.serve(&env, |serve| {
+        fake = Some(env.fake_tools(serve));
+        serve.env("FAKE_KEY_SECONDS", "30");
+    });
+    let fake = fake.unwrap();
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    let inhibitor = logind.next_inhibitor();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    let jira = entry_id(&mut conn, "jira");
+    configure(&mut conn, json!({"autotypeSequence": "{DELAY=1000}{PASSWORD}", "autotypeStartDelayMs": 50}));
+    let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
+    wait_until("wtype is typing", || !fake.read("typed").is_empty());
+    assert_eq!(fake.read("wtype.log"), "-d 1000 -\n");
+
+    logind.prepare_for_sleep(true);
+    // The request ends with the lock; the wtype it started is still there.
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    assert!(helper_of(&daemon).is_some());
+    wait_until("the inhibitor is released", || inhibitor.released());
+    assert_eq!(helper_of(&daemon), None, "the machine went to sleep with a wtype that had a key to type");
+    assert_eq!(fake.read("typed"), "j");
 }
 
 /// A copied value is on the clipboard for as long as the `wl-copy` that the daemon keeps for it

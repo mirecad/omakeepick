@@ -53,9 +53,11 @@ trait Manager {
 /// anyway once that is up.
 async fn settle_limit(manager: &ManagerProxy<'_>) -> Duration {
     match manager.inhibit_delay_max_usec().await {
-        Ok(usec) => Duration::from_micros(usec)
-            .saturating_sub(Duration::from_millis(500))
-            .clamp(Duration::from_secs(1), Duration::from_secs(60)),
+        Ok(usec) => {
+            // Half of it at least, when logind is set to wait less than a second.
+            let allowed = Duration::from_micros(usec);
+            allowed.saturating_sub(Duration::from_millis(500)).max(allowed / 2).min(Duration::from_secs(60))
+        }
         Err(e) => {
             eprintln!("omakeepickd: cannot read InhibitDelayMaxUSec, assuming 5s: {e}");
             Duration::from_millis(4500)

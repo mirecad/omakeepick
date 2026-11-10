@@ -1,12 +1,14 @@
 #!/bin/bash
-# Stands in for wl-paste in the tests: prints the copy a clipboard manager kept, or else what
-# the wl-copy stand-in holds while it is alive.
+# Stands in for wl-paste in the tests: prints the copy of a selection that a clipboard manager
+# kept, or else what the wl-copy stand-in holds while it is alive.
 # FAKE_WL_PASTE=stalls: the compositor, or the manager that has the selection, does not answer.
 [[ ${FAKE_WL_PASTE:-} == stalls ]] && exec sleep 600
-if [[ -e $FAKE_DIR/kept ]]; then
-  cat "$FAKE_DIR/kept"
-elif [[ -e $FAKE_DIR/clipboard.pid ]] && kill -0 "$(< "$FAKE_DIR/clipboard.pid")" 2>/dev/null; then
-  cat "$FAKE_DIR/clipboard"
+which=clipboard
+[[ " $* " == *" --primary "* ]] && which=primary
+if [[ -e $FAKE_DIR/$which.kept ]]; then
+  cat "$FAKE_DIR/$which.kept"
+elif [[ -e $FAKE_DIR/$which.pid ]] && kill -0 "$(< "$FAKE_DIR/$which.pid")" 2>/dev/null; then
+  cat "$FAKE_DIR/$which"
 else
   echo "Nothing is copied" >&2
   exit 1

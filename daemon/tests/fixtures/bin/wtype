@@ -9,6 +9,11 @@ held() {
 }
 
 printf '%s\n' "$*" >> "$FAKE_DIR/wtype.log"
+if [[ " $* " == *" -d 0 "* ]]; then
+  # The real one takes no delay of 0.
+  echo "Invalid sleep time" >&2
+  exit 1
+fi
 if [[ " $* " == *" Insert "* ]]; then
   # A paste: note what the application would have got.
   printf 'pasted %s|%s\n' "$(held clipboard)" "$(held primary)" >> "$FAKE_DIR/wtype.log"

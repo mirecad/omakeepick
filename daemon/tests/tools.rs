@@ -5,6 +5,7 @@
 //! process.
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -72,11 +73,12 @@ async fn tools_end_with_what_started_them() {
     set("OMAKEEPICK_RUNTIME_DIR", runtime.to_str().unwrap());
     let inflight = Tracker::default();
 
-    // Typing: all of the text arrives.
+    // Typing: all of the text arrives. wtype takes no delay of 0, so none is passed then.
     let mut wtype = Wtype::new(&inflight);
     wtype.text("čšž-ľťň p@ss", 0).await.unwrap();
-    assert_eq!(fake.read("typed"), "čšž-ľťň p@ss");
-    assert_eq!(fake.read("wtype.log"), "-d 0 -\n");
+    wtype.text("!", 8).await.unwrap();
+    assert_eq!(fake.read("typed"), "čšž-ľťň p@ss!");
+    assert_eq!(fake.read("wtype.log"), "-\n-d 8 -\n");
     assert_eq!(inflight.count(), 0);
 
     // Dropped while it types (a lock): wtype is not killed, which could leave a key held down.
@@ -110,10 +112,10 @@ async fn tools_end_with_what_started_them() {
     // The clipboard: a value is on it for as long as its owner exists, and not after.
     fake.reset();
     let clipboard = Clipboard::new(inflight.clone());
+    let offered = "offer --foreground --sensitive --type text/plain;charset=utf-8";
     let owner = clipboard.offer("s3cret", false).await.unwrap();
     assert_eq!(fake.selection("clipboard").as_deref(), Some("s3cret"));
-    let offered = "offer --foreground --type text/plain;charset=utf-8";
-    eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered} --sensitive\n")).await;
+    eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered}\n")).await;
     // wl-copy's buffer file is in a directory of the daemon's own, not in /tmp.
     let buffers = || -> Vec<PathBuf> {
         let Ok(dirs) = fs::read_dir(runtime.join("clip")) else { return vec![] };
@@ -126,20 +128,34 @@ async fn tools_end_with_what_started_them() {
     assert_eq!(fake.selection("clipboard"), None);
     assert!(buffers().is_empty(), "the buffer file outlived its wl-copy");
 
-    // The primary selection, and a wl-copy from before 2.3, which has no --sensitive.
+    // The primary selection.
     fake.reset();
-    set("FAKE_OLD_WL_COPY", "1");
-    let old = Clipboard::new(inflight.clone());
-    let owner = old.offer("s3cret", true).await.unwrap();
+    let owner = clipboard.offer("s3cret", true).await.unwrap();
     assert_eq!(fake.selection("primary").as_deref(), Some("s3cret"));
     eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered} --primary\n")).await;
     drop(owner);
     settled(&inflight).await;
+
+    // A wl-copy from before 2.3 is not used: killed, it would leave its buffer file in /tmp.
+    fake.reset();
+    set("FAKE_OLD_WL_COPY", "1");
+    let old = Clipboard::new(inflight.clone());
+    let refused = old.offer("s3cret", false).await.err();
+    assert_eq!(refused.as_deref(), Some("tool_missing:wl-clipboard 2.3 or newer is needed"));
+    assert_eq!(fake.read("wl-copy.log"), "");
+    // Nothing of that answer is kept: with a newer one installed, it works.
     unset("FAKE_OLD_WL_COPY");
+    drop(old.offer("s3cret", false).await.unwrap());
+    settled(&inflight).await;
 
     // A wl-copy that cannot reach the compositor.
     set("FAKE_WL_COPY", "fails");
     assert_eq!(clipboard.offer("s3cret", false).await.err().as_deref(), Some("wl-copy failed"));
+    // The same with more than a pipe holds: it is not waited for to read what it never will.
+    let started = Instant::now();
+    let large = "x".repeat(1 << 20);
+    assert_eq!(clipboard.offer(large, false).await.err().as_deref(), Some("wl-copy failed"));
+    assert!(started.elapsed() < Duration::from_secs(2));
     settled(&inflight).await;
 
     // One that never takes the value (the compositor does not answer): dropping the offer, as
@@ -156,7 +172,8 @@ async fn tools_end_with_what_started_them() {
 
     // Copying: taken back by `forget` (a lock), with nothing run to do it.
     fake.reset();
-    clipboard.copy(Zeroizing::new("first".into())).await.unwrap();
+    let copy = |value: &str| clipboard.copy(Zeroizing::new(value.into()));
+    copy("first").await.unwrap();
     assert_eq!(fake.selection("clipboard").as_deref(), Some("first"));
     clipboard.forget();
     settled(&inflight).await;
@@ -164,39 +181,83 @@ async fn tools_end_with_what_started_them() {
     assert!(!fake.read("wl-copy.log").contains("clear"));
 
     // Taken back when its time is up, unless something was copied since.
-    let first = clipboard.copy(Zeroizing::new("first".into())).await.unwrap();
-    let second = clipboard.copy(Zeroizing::new("second".into())).await.unwrap();
+    let first = copy("first").await.unwrap();
+    let second = copy("second").await.unwrap();
     clipboard.clear_if_unchanged(first, Duration::from_millis(10)).await;
     assert_eq!(fake.selection("clipboard").as_deref(), Some("second"));
     clipboard.clear_if_unchanged(second, Duration::from_millis(10)).await;
     settled(&inflight).await;
     assert_eq!(fake.selection("clipboard"), None);
 
+    // Two at once take their turns, and it is the later one that stays.
+    let (a, b) = tokio::join!(copy("one"), copy("two"));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    let later = if a > b { "one" } else { "two" };
+    assert_eq!(fake.selection("clipboard").as_deref(), Some(later));
+    clipboard.forget();
+    settled(&inflight).await;
+
+    // The user copies something else, which ends our wl-copy: theirs is left alone.
+    fake.reset();
+    copy("ours").await.unwrap();
+    let their_tmp = dir.path().join("theirs");
+    fs::create_dir(&their_tmp).unwrap();
+    let mut theirs = std::process::Command::new("wl-copy")
+        .env("TMPDIR", &their_tmp)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    theirs.stdin.take().unwrap().write_all(b"theirs").unwrap();
+    eventually("theirs is on the clipboard", || fake.selection("clipboard").as_deref() == Some("theirs"))
+        .await;
+    clipboard.forget();
+    settled(&inflight).await;
+    assert_eq!(fake.selection("clipboard").as_deref(), Some("theirs"));
+    assert!(!fake.read("wl-copy.log").contains("clear"));
+    theirs.kill().unwrap();
+    theirs.wait().unwrap();
+
     // A clipboard manager that takes the selection over and keeps a copy: that copy is found
     // by its hash and cleared.
+    let kept = |which: &str| fake.read(&format!("{which}.kept"));
     fake.reset();
     set("FAKE_WL_COPY", "taken-over");
-    clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
-    eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
+    copy("kept by a manager").await.unwrap();
+    eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
     clipboard.forget();
     settled(&inflight).await;
     assert!(fake.read("wl-copy.log").ends_with("clear clipboard\n"), "{}", fake.read("wl-copy.log"));
     // Unless the clipboard has something else by then, however much it looks like it.
     for other in ["kept by a manage", "kept by a manager!", "kept by a managex", ""] {
         fake.reset();
-        clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
-        eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
-        fs::write(fake.0.join("kept"), other).unwrap();
+        copy("kept by a manager").await.unwrap();
+        eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
+        fs::write(fake.0.join("clipboard.kept"), other).unwrap();
         clipboard.forget();
         settled(&inflight).await;
         assert!(!fake.read("wl-copy.log").contains("clear"), "cleared {other:?}");
     }
 
+    // The same for a piece that was only offered for a paste, on either selection.
+    for (primary, which) in [(false, "clipboard"), (true, "primary")] {
+        fake.reset();
+        let owner = clipboard.offer("a pasted piece", primary).await.unwrap();
+        eventually("the manager has its copy", || kept(which) == "a pasted piece").await;
+        drop(owner);
+        settled(&inflight).await;
+        assert!(
+            fake.read("wl-copy.log").ends_with(&format!("clear {which}\n")),
+            "{}",
+            fake.read("wl-copy.log")
+        );
+        assert_eq!(kept(which), "");
+    }
+
     // A search that gets no answer is given up when a suspend can wait no longer, rather than
     // when its own patience ends.
     fake.reset();
-    clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
-    eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
+    copy("kept by a manager").await.unwrap();
+    eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
     set("FAKE_WL_PASTE", "stalls");
     clipboard.forget();
     tokio::time::sleep(Duration::from_millis(100)).await;

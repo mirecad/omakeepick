@@ -1,14 +1,20 @@
 #!/bin/bash
-# Stands in for wl-copy in the tests. Like the real one with --foreground, it takes its stdin
-# into a file under $TMPDIR and then stays for as long as it owns the selection. The selection
-# is the file $FAKE_DIR/clipboard (or primary), which counts only while the process named in
-# the .pid file next to it is alive. FAKE_WL_COPY makes it misbehave:
+# Stands in for wl-copy (wl-clipboard 2.3) in the tests. Like the real one with --foreground,
+# it takes its stdin into a file under $TMPDIR and then stays for as long as it owns the
+# selection: until another one takes that selection, or it is killed. The selection is the file
+# $FAKE_DIR/clipboard (or primary), which counts only while the process named in the .pid
+# file next to it is alive. Unlike the real one it does not unlink its buffer file, so the
+# tests see that the daemon removes the directory with whatever is in it.
+#
+# FAKE_WL_COPY makes it misbehave:
 #   stalls      never gets as far as reading its stdin (a compositor that does not answer)
 #   fails       cannot reach the compositor at all
 #   taken-over  loses the selection at once to a clipboard manager, which keeps a copy
+#               ($FAKE_DIR/clipboard.kept, which is what the wl-paste stand-in then shows)
+# FAKE_OLD_WL_COPY makes it one from before 2.3, which does not know --sensitive.
 args=" $* "
 if [[ $args == *" --version "* ]]; then
-  # Before 2.3 there was no --sensitive, and an unknown option is an error.
+  # An unknown option is an error, whatever else is asked.
   [[ -n ${FAKE_OLD_WL_COPY:-} && $args == *" --sensitive "* ]] && exit 1
   exit 0
 fi
@@ -16,20 +22,25 @@ which=clipboard
 [[ $args == *" --primary "* ]] && which=primary
 if [[ $args == *" --clear "* ]]; then
   printf 'clear %s\n' "$which" >> "$FAKE_DIR/wl-copy.log"
-  rm -f "$FAKE_DIR/$which" "$FAKE_DIR/$which.pid" "$FAKE_DIR/kept"
+  rm -f "$FAKE_DIR/$which" "$FAKE_DIR/$which.pid" "$FAKE_DIR/$which.kept"
   exit 0
 fi
 case ${FAKE_WL_COPY:-} in
-  stalls) exec sleep 600 ;;
+  stalls)
+    printf 'stalled\n' >> "$FAKE_DIR/wl-copy.log"
+    exec sleep 600
+    ;;
   fails) exit 1 ;;
 esac
+# Whoever had the selection loses it.
+[[ -e $FAKE_DIR/$which.pid ]] && kill "$(< "$FAKE_DIR/$which.pid")" 2>/dev/null
 # The selection is there from the moment the value is: no step in between for a test to race.
 ln -sf "$TMPDIR/buffer" "$FAKE_DIR/$which"
 echo $$ > "$FAKE_DIR/$which.pid"
 cat > "$TMPDIR/buffer" || exit 1
 printf 'offer %s\n' "$*" >> "$FAKE_DIR/wl-copy.log"
 if [[ ${FAKE_WL_COPY:-} == taken-over ]]; then
-  cp "$TMPDIR/buffer" "$FAKE_DIR/kept"
+  cp "$TMPDIR/buffer" "$FAKE_DIR/$which.kept"
   exit 0
 fi
 exec sleep 600

@@ -23,7 +23,7 @@ https://github.com/user-attachments/assets/ad275e2c-312c-4ed2-b3a7-d86c1eb85e74
 ## Requirements
 
 - Omarchy 4.
-- `wtype` for auto-type and `wl-clipboard` for copying. Both ship with Omarchy.
+- `wtype` for auto-type and `wl-clipboard` 2.3 or newer for copying. Both ship with Omarchy.
 - `curl`, to download the prebuilt helper (x86_64 only). Elsewhere, or with
   `bin/install --source`, the helper is built from source, which needs Rust
   (`omarchy pkg add rust`).
@@ -119,7 +119,8 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
   works and you need the master password.
 - A lock always wins. If the screen locks or the machine suspends while an unlock is still
   running, that unlock is stopped and the database stays locked. Auto-type in progress stops
-  within half a second, and a copied value is taken off the clipboard at once. Before suspend,
+  within half a second (after one more key, if you set keys slower than that), and a copied
+  value is taken off the clipboard at once. Before suspend,
   the daemon holds the system back for a few seconds at most until this is done, and once a
   suspend has started nothing can be unlocked until the machine is awake again.
 
@@ -219,14 +220,16 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
       --foreground`), with its buffer file in the daemon's runtime directory, not in `/tmp`.
       That process is the clipboard entry: clearing it is killing it, which the daemon does
       itself, at once, on a lock, when the clear timer runs out and when it exits. Nothing
-      else has to answer for the value to be gone, and the clipboard is never read back to
-      check. Two limits: `wl-copy` ends on its own as soon as you copy something else, and a
-      clipboard manager that keeps copies in spite of the "sensitive" hint has its own copy.
-      Omarchy's clipboard history honours the hint. For a manager that takes the selection
-      over, the daemon still looks for its value there and clears it, as far as that manager
-      and the compositor answer.
+      else has to answer for the value to be gone, and as long as that process runs the
+      clipboard is not read back to check. This is why wl-clipboard 2.3 is needed: an older
+      `wl-copy` kept its buffer in `/tmp` and would leave it there when killed.
+    - What that cannot reach is a copy somebody else made. `wl-copy` ends on its own as soon
+      as you copy something else, and a clipboard manager that keeps copies in spite of the
+      "sensitive" hint has its own. Omarchy's clipboard history honours the hint. For a
+      manager that takes the selection over, the daemon reads the clipboard once, and clears
+      it if it is still its value, as far as that manager and the compositor answer.
     - Before a suspend the daemon waits until all of these are gone, and a `wtype` that is
-      still typing when logind's time is up is killed.
+      still at it when logind's time is nearly up is killed.
   - That covers the database and the key file, which can be on network or removable storage.
     The daemon's own files are another matter: its binary, its log and its state file live in
     your home directory, and if that is a network mount that hangs, the daemon hangs with it,
