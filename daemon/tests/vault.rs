@@ -146,12 +146,15 @@ fn autotype_sequences_and_secret_fields() {
 
     let bank = open.entry(&uuid("Bank")).unwrap();
     assert_eq!(vault::autotype_sequence(&open.db, &bank, "{PASSWORD}"), "{PASSWORD}");
-    let tokens = autotype::parse("{USERNAME}{TAB}{PASSWORD}{TAB}{S:PIN}", &EntryFields(&bank)).unwrap();
-    let texts: Vec<String> = tokens
+    // A sequence names its fields; the values come from the entry when they are typed.
+    let tokens = autotype::parse("{USERNAME}{TAB}{PASSWORD}{TAB}{S:PIN}").unwrap();
+    let fields = EntryFields(&bank);
+    let values: Vec<String> = tokens
         .iter()
-        .filter_map(|t| if let Token::Text(t) = t { Some(t.to_string()) } else { None })
+        .filter_map(|t| if let Token::Field(name) = t { fields.field(name).unwrap() } else { None })
+        .map(|value| value.to_string())
         .collect();
-    assert_eq!(texts, ["1234567", "čšž-ľťň", "4321"]);
+    assert_eq!(values, ["1234567", "čšž-ľťň", "4321"]);
 }
 
 #[test]

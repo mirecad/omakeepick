@@ -1,8 +1,10 @@
 //! Automatic locking: idle timeout, suspend/hibernate and logind session lock.
 //!
-//! Before sleep the database is locked, the quick-unlock key wiped and any unlock that is still
-//! running stopped (its credentials dropped, its helper killed), all while holding a logind
-//! "delay" inhibitor, so nothing decrypted is left in RAM (or in the hibernation image).
+//! Before sleep the database is locked, the quick-unlock key wiped and whatever is still
+//! running stopped (an unlock drops its credentials and its helper is killed; a copy or an
+//! auto-type drops its value, and the `wl-copy` holding a copied one is killed), all while
+//! holding a logind "delay" inhibitor, so nothing decrypted is left in RAM (or in the
+//! hibernation image).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -45,10 +47,10 @@ trait Manager {
     fn inhibit_delay_max_usec(&self) -> zbus::Result<u64>;
 }
 
-/// How long to wait for in-flight work (a copy or auto-type still running, a killed helper not
-/// reaped yet; an unlock is stopped, not waited for) before releasing the inhibitor: all the
-/// time logind gives us, minus a margin for the release itself. logind sleeps anyway once that
-/// is up.
+/// How long to wait before releasing the inhibitor for what the lock has stopped to be gone
+/// (requests returning, killed processes being reaped, a `wtype` typing the last of what it was
+/// handed): all the time logind gives us, minus a margin for the release itself. logind sleeps
+/// anyway once that is up.
 async fn settle_limit(manager: &ManagerProxy<'_>) -> Duration {
     match manager.inhibit_delay_max_usec().await {
         Ok(usec) => Duration::from_micros(usec)
@@ -121,10 +123,10 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
             // Nothing is unlocked from here until the wake-up: an unlock that starts after
             // the lock below would not be cancelled by it.
             daemon.going_to_sleep();
-            // The database is wiped at once and a running unlock stopped: it drops its
-            // credentials and its helper is killed. Then wait for the helper to be gone, for
-            // the clipboard clear and for any copy or auto-type still holding secrets, so they
-            // finish (and are discarded) before the inhibitor is released.
+            // The database is wiped at once and whatever was running stopped: an unlock drops
+            // its credentials and its helper is killed, a copy or an auto-type drops its
+            // value, the wl-copy that holds a copied value is killed. Then wait until those
+            // processes are gone before the inhibitor is released.
             daemon.lock_and_settle(LockReason::Sleep, limit).await;
             // Releasing the inhibitor lets the system go to sleep.
             inhibitor = None;

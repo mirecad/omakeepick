@@ -76,6 +76,43 @@ impl Env {
     }
 }
 
+/// The stand-ins for `wtype`, `wl-copy`, `wl-paste` and `hyprctl` in `tests/fixtures/bin`, as a
+/// daemon started with [`Env::fake_tools`] runs them: this is the directory they record in.
+struct Fake(PathBuf);
+
+impl Fake {
+    fn read(&self, name: &str) -> String {
+        std::fs::read_to_string(self.0.join(name)).unwrap_or_default()
+    }
+
+    /// What is on the selection `which`: something only while the `wl-copy` that offered it
+    /// is alive.
+    fn selection(&self, which: &str) -> Option<String> {
+        let pid: u32 = self.read(&format!("{which}.pid")).trim().parse().ok()?;
+        is_alive(pid).then(|| self.read(which))
+    }
+}
+
+impl Env {
+    /// Makes the daemon that `serve` starts find the stand-ins before the real tools.
+    fn fake_tools(&self, serve: &mut Command) -> Fake {
+        let dir = self.dir.path().join("fake");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = format!("{}:{}", fixture("bin").display(), std::env::var("PATH").unwrap_or_default());
+        serve.env("PATH", path).env("FAKE_DIR", &dir);
+        Fake(dir)
+    }
+}
+
+/// The ID of the first entry that `query` finds.
+fn entry_id(conn: &mut Conn, query: &str) -> String {
+    conn.request("search", json!({"query": query}))["entries"][0]["id"].as_str().unwrap().to_string()
+}
+
+fn configure(conn: &mut Conn, settings: Value) {
+    assert_eq!(conn.request("configure", json!({"settings": settings}))["ok"], true);
+}
+
 struct Daemon {
     child: Child,
 }
@@ -1001,6 +1038,179 @@ fn a_sleep_waits_for_what_is_still_in_flight() {
     let state = conn.state();
     assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
     assert_eq!(state["quickUnlock"], false);
+}
+
+/// A lock ends an auto-type wherever it is, and what the action has in hand at that point is
+/// as little as it can be: nothing in a pause, since a field's value is taken from the database
+/// only when it is typed, and otherwise the value being typed, which goes with the action.
+#[test]
+fn a_lock_ends_an_auto_type_wherever_it_is() {
+    let env = Env::new();
+    let mut serve = env.command(&["serve"]);
+    let fake = env.fake_tools(&mut serve);
+    serve.env("FAKE_KEY_SECONDS", "0.05");
+    let daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    // User name "madev@work", password "jira pw", and a note of thirty characters.
+    let jira = entry_id(&mut conn, "jira");
+    let sequence = |sequence: &str, key_delay: u32| json!({"autotypeSequence": sequence, "autotypeStartDelayMs": 50, "typeDelayMs": key_delay});
+
+    // In a pause, which nothing but the lock ends for ten seconds.
+    configure(&mut conn, sequence("{USERNAME}{DELAY 10000}{PASSWORD}", 0));
+    let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
+    wait_until("the user name is typed", || fake.read("typed") == "madev@work");
+    let locked = Instant::now();
+    assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    assert!(locked.elapsed() < Duration::from_secs(2), "the lock waited for the pause");
+    wait_until("wtype has ended", || helper_of(&daemon).is_none());
+    assert_eq!(fake.read("typed"), "madev@work");
+
+    // While a value is being typed. The daemon drops it at once; wtype is not killed (it
+    // could have a key down) and types what it was handed, which is no more than it types in
+    // half a second: two characters, with the keys set this slow.
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    configure(&mut conn, sequence("{NOTES}", 200));
+    let note = "Ask IT for the recovery codes.";
+    let typed_note = || fake.read("typed")["madev@work".len()..].to_string();
+    let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
+    wait_until("the note is being typed", || typed_note().len() >= 2);
+    assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    wait_until("wtype has ended", || helper_of(&daemon).is_none());
+    let typed = typed_note();
+    assert!(note.starts_with(&typed) && typed.len() < note.len() / 2, "{typed:?}");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(typed_note(), typed, "something was typed after the lock");
+    assert_eq!(conn.state()["phase"], "locked");
+}
+
+/// A sleep is not held back by an action, whatever the action was waiting for: a pause in an
+/// auto-type sequence, or a `wl-copy` that never takes the value because the compositor does
+/// not answer. The lock ends both at once, so the inhibitor goes as soon as they are gone, and
+/// not when logind's patience (three seconds in the stand-in) runs out.
+#[test]
+fn a_sleep_is_not_held_back_by_an_action() {
+    let env = Env::new();
+    let Some(logind) = FakeLogind::start(env.dir.path()) else {
+        eprintln!("skipped: dbus-daemon is not installed");
+        return;
+    };
+    let mut fake = None;
+    let daemon = logind.serve(&env, |serve| {
+        fake = Some(env.fake_tools(serve));
+        serve.env("FAKE_WL_COPY", "stalls");
+    });
+    let fake = fake.unwrap();
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    let asleep_within = |inhibitor: &Inhibitor, what: &str| {
+        let announced = Instant::now();
+        logind.prepare_for_sleep(true);
+        wait_until("the inhibitor is released", || inhibitor.released());
+        assert!(announced.elapsed() < Duration::from_millis(1500), "the sleep waited for {what}");
+    };
+
+    let inhibitor = logind.next_inhibitor();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    let jira = entry_id(&mut conn, "jira");
+    configure(
+        &mut conn,
+        json!({"autotypeSequence": "{USERNAME}{DELAY 10000}{PASSWORD}", "autotypeStartDelayMs": 50}),
+    );
+    let id = conn.send("act", json!({"entry": jira, "action": "autotype"}));
+    wait_until("the user name is typed", || fake.read("typed") == "madev@work");
+    asleep_within(&inhibitor, "the pause");
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    assert_eq!(fake.read("typed"), "madev@work");
+
+    logind.prepare_for_sleep(false);
+    let inhibitor = logind.next_inhibitor();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    let id = conn.send("act", json!({"entry": jira, "action": "copyPassword"}));
+    wait_until("wl-copy is running", || helper_of(&daemon).is_some());
+    asleep_within(&inhibitor, "wl-copy");
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    // It was killed, with the password it was never going to take still in its pipe.
+    assert_eq!(helper_of(&daemon), None);
+    assert_eq!(fake.selection("clipboard"), None);
+}
+
+/// A copied value is on the clipboard for as long as the `wl-copy` that the daemon keeps for it
+/// lives. A lock, the clear timer and the daemon's exit all take the value back by killing that
+/// process: nothing has to answer for it to be gone.
+#[test]
+fn a_copied_value_is_taken_back() {
+    let env = Env::new();
+    let mut serve = env.command(&["serve"]);
+    let fake = env.fake_tools(&mut serve);
+    let mut daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    let gitea = entry_id(&mut conn, "gitea");
+    let copy = |conn: &mut Conn, action: &str| conn.request("act", json!({"entry": gitea, "action": action}));
+
+    let copied = copy(&mut conn, "copyPassword");
+    assert_eq!((copied["copied"].clone(), copied["clearsIn"].clone()), (json!("password"), json!(15)));
+    assert_eq!(fake.selection("clipboard").as_deref(), Some("admin-pw"));
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    wait_until("the clipboard is empty", || fake.selection("clipboard").is_none());
+
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    configure(&mut conn, json!({"clipboardClearSeconds": 1}));
+    assert_eq!(copy(&mut conn, "copyUsername")["clearsIn"], 1);
+    assert_eq!(fake.selection("clipboard").as_deref(), Some("admin"));
+    wait_until("the clipboard is empty", || fake.selection("clipboard").is_none());
+    assert_eq!(conn.state()["phase"], "unlocked");
+
+    configure(&mut conn, json!({"clipboardClearSeconds": 0}));
+    assert_eq!(copy(&mut conn, "copyUrl")["ok"], true);
+    assert_eq!(fake.selection("clipboard").as_deref(), Some("http://gitea.lan:3000"));
+    assert_eq!(conn.request("quit", json!({}))["ok"], true);
+    wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
+    assert_eq!(fake.selection("clipboard"), None);
+    // The value was only ever taken back by ending its wl-copy.
+    assert!(!fake.read("wl-copy.log").contains("clear"), "{}", fake.read("wl-copy.log"));
+    // wl-copy's buffer files were in the daemon's runtime directory, and are gone with it.
+    let left: Vec<_> = std::fs::read_dir(env.dir.path().join("run/clip")).unwrap().flatten().collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// In an XWayland window the text is pasted, a piece at a time. Each piece is on the two
+/// selections for its paste only, and a lock takes it off them at once.
+#[test]
+fn pasting_into_xwayland_leaves_nothing_on_the_clipboard() {
+    let env = Env::new();
+    let mut serve = env.command(&["serve"]);
+    let fake = env.fake_tools(&mut serve);
+    serve.env("FAKE_XWAYLAND", "true");
+    let daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    configure(&mut conn, json!({"autotypeStartDelayMs": 50}));
+    let gitea = entry_id(&mut conn, "gitea");
+
+    assert_eq!(conn.request("act", json!({"entry": gitea, "action": "autotype"}))["ok"], true);
+    let paste = "-M shift -k Insert -m shift\n";
+    assert_eq!(
+        fake.read("wtype.log"),
+        format!("{paste}pasted admin|admin\n-k Tab\n{paste}pasted admin-pw|admin-pw\n-k Return\n")
+    );
+    assert_eq!(fake.read("typed"), "");
+    wait_until("the selections are empty", || {
+        fake.selection("clipboard").is_none() && fake.selection("primary").is_none()
+    });
+
+    let id = conn.send("act", json!({"entry": gitea, "action": "typePassword"}));
+    wait_until("the password is on the clipboard", || fake.selection("clipboard").is_some());
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    wait_until("the tools are gone", || helper_of(&daemon).is_none());
+    assert_eq!((fake.selection("clipboard"), fake.selection("primary")), (None, None));
 }
 
 /// A private session bus whose one service stands in for xdg-desktop-portal's FileChooser. Like

@@ -9,16 +9,26 @@
 //! * `{CLEARFIELD}` (Ctrl+A, Backspace), and literal escapes `{+}` `{^}` `{%}` `{~}` `{{}` `{}}`
 //!   `{(}` `{)}` `{[}` `{]}`
 //!
-//! Field values (passwords, usernames, TOTP codes…) are piped to `wtype -` on stdin; they never
+//! Field values (passwords, usernames, TOTP codes…) go to `wtype -` on stdin; they never
 //! appear on a command line. Only key names and the literal characters of chords like `^a`
 //! are passed as arguments.
+//!
+//! A value is in this code's hands only while it is being typed. A placeholder stays a name
+//! until its turn comes; then the value is taken from the database, given to `wtype` a short
+//! burst at a time, and dropped. So a pause, the wait before typing starts and the key presses
+//! in between hold no secret. Dropping the future that types, which is what a lock does, wipes
+//! the value; what is left is the burst `wtype` already has, which it types to the end.
 
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use zeroize::Zeroizing;
+
+use crate::clipboard::Clipboard;
+use crate::inflight::Tracker;
+use crate::tool::{Stop, Tool};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Modifier {
@@ -37,11 +47,14 @@ impl Modifier {
     }
 }
 
-// Debug only in tests: `Text` holds secrets.
+// Debug only in tests: `Text` is part of the database.
 #[cfg_attr(test, derive(Debug, PartialEq))]
 pub enum Token {
-    /// Text to type literally. May contain secrets.
+    /// Literal text of the sequence.
     Text(Zeroizing<String>),
+    /// A field placeholder, by the name [`Fields`] knows it under. Its value is looked up when
+    /// its turn comes, not before.
+    Field(String),
     /// An xkb keysym name, pressed `repeat` times with `mods` held.
     Key {
         name: &'static str,
@@ -58,7 +71,8 @@ pub enum Token {
     SetKeyDelay(u64),
 }
 
-/// Resolves field placeholders (`USERNAME`, `S:Name`, `TOTP`, …) to their values.
+/// Resolves field placeholders (`USERNAME`, `S:Name`, `TOTP`, …) to their values. `None` is a
+/// field the entry does not have, which types nothing.
 pub trait Fields {
     fn field(&self, name: &str) -> Result<Option<Zeroizing<String>>, String>;
 }
@@ -130,16 +144,6 @@ struct Builder {
 impl Builder {
     /// Literal text from the sequence itself. Adjacent literals share one token.
     fn text(&mut self, s: &str) {
-        self.push_text(s, false);
-    }
-
-    /// A field value. Always its own token: growing a Zeroizing<String> would leave the old
-    /// buffer behind unwiped.
-    fn secret(&mut self, s: &str) {
-        self.push_text(s, true);
-    }
-
-    fn push_text(&mut self, s: &str, secret: bool) {
         if s.is_empty() {
             return;
         }
@@ -152,15 +156,19 @@ impl Builder {
         if rest.is_empty() {
             return;
         }
-        if !secret
-            && self.last_literal
+        if self.last_literal
             && let Some(Token::Text(prev)) = self.tokens.last_mut()
         {
             prev.push_str(rest);
             return;
         }
         self.tokens.push(Token::Text(Zeroizing::new(rest.to_string())));
-        self.last_literal = !secret;
+        self.last_literal = true;
+    }
+
+    fn field(&mut self, name: String) {
+        self.tokens.push(Token::Field(name));
+        self.last_literal = false;
     }
 
     fn key(&mut self, name: &'static str, repeat: u32) {
@@ -179,7 +187,8 @@ impl Builder {
 /// Longest sequence accepted. Sequences can come from the database, so from a sync peer.
 const MAX_SEQUENCE_LEN: usize = 4096;
 
-pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> {
+/// Parses a sequence. No field is looked at here: placeholders become [`Token::Field`].
+pub fn parse(sequence: &str) -> Result<Vec<Token>, String> {
     if sequence.len() > MAX_SEQUENCE_LEN {
         return Err("The auto-type sequence is too long".into());
     }
@@ -213,7 +222,7 @@ pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> 
                         None => return Err("Unclosed placeholder in auto-type sequence".into()),
                     }
                 }
-                placeholder(&mut b, &inner, fields)?;
+                placeholder(&mut b, &inner)?;
             }
             other => b.text(other.encode_utf8(&mut [0; 4])),
         }
@@ -223,7 +232,7 @@ pub fn parse(sequence: &str, fields: &dyn Fields) -> Result<Vec<Token>, String> 
 
 // Errors never quote the sequence: it is part of the database, and the message ends up in a
 // desktop notification.
-fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), String> {
+fn placeholder(b: &mut Builder, inner: &str) -> Result<(), String> {
     if matches!(inner, "+" | "^" | "%" | "~" | "{" | "(" | ")" | "[" | "]") {
         b.text(inner);
         return Ok(());
@@ -271,25 +280,25 @@ fn placeholder(b: &mut Builder, inner: &str, fields: &dyn Fields) -> Result<(), 
     if !b.mods.is_empty() {
         return Err("Modifiers before a field are not supported in auto-type sequences".into());
     }
-    match fields.field(&field_name)? {
-        Some(value) => b.secret(&value),
-        None => b.mods.clear(),
-    }
+    b.field(field_name);
     Ok(())
 }
 
 /// Sends tokens to the focused window.
 #[allow(async_fn_in_trait)] // only used with concrete types on one thread
 pub trait Typist {
+    /// How many characters to hand to [`text`](Self::text) at a time.
+    fn burst(&self, key_delay: u64) -> usize;
     async fn text(&mut self, text: &str, key_delay: u64) -> Result<(), String>;
     async fn key(&mut self, name: &str, mods: &[Modifier], repeat: u32) -> Result<(), String>;
     async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String>;
 }
 
-/// The error `run` returns when `keep_going` says to stop.
+/// What an action cut short by a lock fails with.
 pub const CANCELLED: &str = "cancelled";
 
-const TEXT_CHUNK_CHARS: usize = 64;
+/// The most text a typist is handed at a time.
+const MAX_BURST_CHARS: usize = 64;
 const MAX_TYPED_CHARS: usize = 8192;
 
 /// Splits `text` on character boundaries into pieces of at most `n` characters.
@@ -306,33 +315,25 @@ fn chunks(text: &str, n: usize) -> impl Iterator<Item = &str> {
     })
 }
 
-/// Types `tokens`. `keep_going` is asked before every token, so a lock that arrives while a
-/// sequence is being typed stops it before the next field is typed.
+/// Types `tokens`. A field's value is asked of `fields` when its turn comes and dropped as soon
+/// as it is typed.
+///
+/// Stopping it is dropping it, and that is safe at any point: the value in hand is wiped with
+/// the future, and what a typist has started ends on its own or is ended (see [`Tool`]).
 pub async fn run(
     tokens: &[Token],
+    fields: &impl Fields,
     typist: &mut impl Typist,
     key_delay: u64,
-    keep_going: impl Fn() -> bool,
 ) -> Result<(), String> {
     let mut delay = key_delay;
     let mut typed = 0usize;
     for token in tokens {
-        if !keep_going() {
-            return Err(CANCELLED.into());
-        }
         match token {
-            Token::Text(text) => {
-                // In small pieces, so a lock stops the typing within a few characters, and
-                // with a ceiling: a sequence from the database could ask for a megabyte.
-                for chunk in chunks(text, TEXT_CHUNK_CHARS) {
-                    typed += chunk.chars().count();
-                    if typed > MAX_TYPED_CHARS {
-                        return Err("The auto-type sequence types too much text".into());
-                    }
-                    if !keep_going() {
-                        return Err(CANCELLED.into());
-                    }
-                    typist.text(chunk, delay).await?;
+            Token::Text(text) => type_text(text, typist, delay, &mut typed).await?,
+            Token::Field(name) => {
+                if let Some(value) = fields.field(name)? {
+                    type_text(&value, typist, delay, &mut typed).await?;
                 }
             }
             Token::Key { name, mods, repeat } => typist.key(name, mods, *repeat).await?,
@@ -344,28 +345,21 @@ pub async fn run(
     Ok(())
 }
 
-async fn wtype(args: &[String], stdin: Option<&[u8]>) -> Result<(), String> {
-    let mut child = Command::new("wtype")
-        .args(args)
-        .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => "tool_missing:wtype is not installed".to_string(),
-            _ => format!("Cannot run wtype: {e}"),
-        })?;
-    if let Some(data) = stdin {
-        let mut pipe = child.stdin.take().expect("piped stdin");
-        pipe.write_all(data).await.map_err(|e| format!("wtype: {e}"))?;
+/// In bursts, each of them one `wtype` or one paste, and with a ceiling: a sequence from the
+/// database could ask for a megabyte.
+async fn type_text(
+    text: &str,
+    typist: &mut impl Typist,
+    key_delay: u64,
+    typed: &mut usize,
+) -> Result<(), String> {
+    for burst in chunks(text, typist.burst(key_delay).clamp(1, MAX_BURST_CHARS)) {
+        *typed += burst.chars().count();
+        if *typed > MAX_TYPED_CHARS {
+            return Err("The auto-type sequence types too much text".into());
+        }
+        typist.text(burst, key_delay).await?;
     }
-    let out = child.wait_with_output().await.map_err(|e| format!("wtype: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("wtype failed: {}", err.trim()));
-    }
-    // Give the compositor a moment between virtual keyboards so events stay in order.
-    tokio::time::sleep(Duration::from_millis(12)).await;
     Ok(())
 }
 
@@ -381,113 +375,232 @@ fn with_mods(mods: &[Modifier], inner: impl IntoIterator<Item = String>) -> Vec<
     args
 }
 
+/// What `wtype` needs for one key besides the delay it is asked for: a press and a release,
+/// two milliseconds each.
+const KEY_MILLIS: u64 = 4;
+
+/// How long the text handed to one `wtype` may take to type. `wtype` reads all of its input
+/// before it types any, so this is how long it goes on typing after a lock, and how long a
+/// suspend waits for it.
+const BURST_MILLIS: u64 = 500;
+
+/// How much longer than its work should take a `wtype` may run once nobody waits for it.
+const GRACE: Duration = Duration::from_millis(500);
+
+fn typing_time(keys: u64, key_delay: u64) -> Duration {
+    Duration::from_millis(keys * (key_delay + KEY_MILLIS))
+}
+
 /// Types with the virtual-keyboard protocol. Works for native Wayland windows.
-pub struct Wtype;
+pub struct Wtype {
+    inflight: Tracker,
+}
+
+impl Wtype {
+    pub fn new(inflight: &Tracker) -> Wtype {
+        Wtype { inflight: inflight.clone() }
+    }
+
+    /// Starts a `wtype` that has `work` to do. It is not killed while it does it: between a
+    /// key press and its release, that would leave the key held down in the focused window.
+    /// Left alone it ends by itself, and is killed only if it takes much longer than it should.
+    fn start(&self, args: &[String], stdin: Stdio, work: Duration) -> Result<Tool, String> {
+        let mut command = Command::new("wtype");
+        command.args(args).stdin(stdin).stdout(Stdio::null()).stderr(Stdio::piped());
+        Tool::spawn(command, Stop::Within(work + GRACE), None, &self.inflight).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => "tool_missing:wtype is not installed".to_string(),
+            _ => format!("Cannot run wtype: {e}"),
+        })
+    }
+
+    /// Runs `wtype` with arguments only: modifier and key names, and the character of a chord.
+    async fn press(&self, args: &[String], keys: u32) -> Result<(), String> {
+        finish(self.start(args, Stdio::null(), typing_time(u64::from(keys), 0))?).await
+    }
+}
+
+/// Waits for `wtype` to end. A failure is reported with what it printed.
+async fn finish(mut tool: Tool) -> Result<(), String> {
+    let mut stderr = tool.stderr();
+    let mut message = Vec::new();
+    let read = async {
+        if let Some(stderr) = &mut stderr {
+            let _ = stderr.read_to_end(&mut message).await;
+        }
+    };
+    let (status, ()) = tokio::join!(tool.wait(), read);
+    if !status.map_err(|e| format!("wtype: {e}"))?.success() {
+        return Err(format!("wtype failed: {}", String::from_utf8_lossy(&message).trim()));
+    }
+    // Give the compositor a moment between virtual keyboards so events stay in order.
+    tokio::time::sleep(Duration::from_millis(12)).await;
+    Ok(())
+}
 
 impl Typist for Wtype {
+    fn burst(&self, key_delay: u64) -> usize {
+        usize::try_from(BURST_MILLIS / (key_delay + KEY_MILLIS)).unwrap_or(1)
+    }
+
     async fn text(&mut self, text: &str, key_delay: u64) -> Result<(), String> {
-        wtype(&["-d".into(), key_delay.to_string(), "-".into()], Some(text.as_bytes())).await
+        let work = typing_time(text.chars().count() as u64, key_delay);
+        let mut tool = self.start(&["-d".into(), key_delay.to_string(), "-".into()], Stdio::piped(), work)?;
+        let mut stdin = tool.stdin().expect("piped stdin");
+        let written = stdin.write_all(text.as_bytes()).await;
+        drop(stdin);
+        // A wtype that could not be written to has ended; `finish` says why.
+        finish(tool).await?;
+        written.map_err(|e| format!("wtype: {e}"))
     }
 
     async fn key(&mut self, name: &str, mods: &[Modifier], repeat: u32) -> Result<(), String> {
         let keys = (0..repeat).flat_map(|_| ["-k".to_string(), name.to_string()]);
-        wtype(&with_mods(mods, keys), None).await
+        self.press(&with_mods(mods, keys), repeat).await
     }
 
     async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String> {
-        wtype(&with_mods(mods, ["--".to_string(), text.to_string()]), None).await
+        self.press(&with_mods(mods, ["--".to_string(), text.to_string()]), 1).await
     }
 }
 
-/// XWayland windows mis-handle wtype's per-character keymaps, so text is pasted instead:
-/// copied (as sensitive) to both clipboard and primary selection, then Shift+Insert.
-/// Both selections are cleared by `finish`, which callers run whatever the outcome.
-#[derive(Default)]
-pub struct PasteTypist {
-    used: bool,
+/// XWayland windows mis-handle wtype's per-character keymaps, so text is pasted instead: offered
+/// (as sensitive) on both the clipboard and the primary selection, then Shift+Insert.
+pub struct PasteTypist<'a> {
+    clipboard: &'a Clipboard,
+    keys: Wtype,
 }
 
-impl PasteTypist {
-    pub async fn finish(self) {
-        if self.used {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            crate::clipboard::clear_all().await;
-        }
+impl<'a> PasteTypist<'a> {
+    pub fn new(clipboard: &'a Clipboard, inflight: &Tracker) -> PasteTypist<'a> {
+        PasteTypist { clipboard, keys: Wtype::new(inflight) }
     }
 }
 
-impl Typist for PasteTypist {
+impl Typist for PasteTypist<'_> {
+    fn burst(&self, _key_delay: u64) -> usize {
+        MAX_BURST_CHARS
+    }
+
     async fn text(&mut self, text: &str, _key_delay: u64) -> Result<(), String> {
-        self.used = true;
-        crate::clipboard::set(text.as_bytes(), false).await?;
-        crate::clipboard::set(text.as_bytes(), true).await?;
+        // Each selection is held by a `wl-copy` of its own, which is killed when this returns
+        // or is dropped: the piece is on the selections for this paste only.
+        let _clipboard = self.clipboard.offer(text, false).await?;
+        let _primary = self.clipboard.offer(text, true).await?;
         tokio::time::sleep(Duration::from_millis(60)).await;
-        wtype(&with_mods(&[Modifier::Shift], ["-k".into(), "Insert".into()]), None).await?;
-        // The application reads the selection asynchronously; then take the value back at
-        // once, rather than leaving it on both selections until the sequence ends.
+        self.keys.key("Insert", &[Modifier::Shift], 1).await?;
+        // The application reads the selection asynchronously.
         tokio::time::sleep(Duration::from_millis(250)).await;
-        crate::clipboard::clear_all().await;
-        self.used = false;
         Ok(())
     }
 
     async fn key(&mut self, name: &str, mods: &[Modifier], repeat: u32) -> Result<(), String> {
-        Wtype.key(name, mods, repeat).await
+        self.keys.key(name, mods, repeat).await
     }
 
     async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String> {
-        Wtype.chord(text, mods).await
+        self.keys.chord(text, mods).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
 
-    struct Map(HashMap<&'static str, &'static str>);
+    /// What happened, in order: fields asked for and what the typist was told to do.
+    #[derive(Default)]
+    struct Log(RefCell<Vec<String>>);
 
-    impl Fields for Map {
+    impl Log {
+        fn take(&self) -> Vec<String> {
+            self.0.take()
+        }
+    }
+
+    struct Map<'a>(HashMap<&'static str, &'static str>, &'a Log);
+
+    impl Fields for Map<'_> {
         fn field(&self, name: &str) -> Result<Option<Zeroizing<String>>, String> {
+            self.1.0.borrow_mut().push(format!("field({name})"));
             Ok(self.0.get(name).map(|v| Zeroizing::new(v.to_string())))
         }
     }
 
-    fn fields() -> Map {
-        Map(HashMap::from([
-            ("USERNAME", "madev"),
-            ("PASSWORD", "p@ss{}~+"),
-            ("S:PIN", "4321"),
-            ("TOTP", "123456"),
-        ]))
+    fn fields(log: &Log) -> Map<'_> {
+        Map(
+            HashMap::from([
+                ("USERNAME", "madev"),
+                ("PASSWORD", "p@ss{}~+"),
+                ("S:PIN", "4321"),
+                ("TOTP", "123456"),
+            ]),
+            log,
+        )
+    }
+
+    struct Recorder<'a>(&'a Log);
+
+    impl Typist for Recorder<'_> {
+        fn burst(&self, _key_delay: u64) -> usize {
+            usize::MAX
+        }
+        async fn text(&mut self, text: &str, key_delay: u64) -> Result<(), String> {
+            self.0.0.borrow_mut().push(format!("text({text},{key_delay})"));
+            Ok(())
+        }
+        async fn key(&mut self, name: &str, mods: &[Modifier], repeat: u32) -> Result<(), String> {
+            self.0.0.borrow_mut().push(format!("key({name},{mods:?},{repeat})"));
+            Ok(())
+        }
+        async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String> {
+            self.0.0.borrow_mut().push(format!("chord({text},{mods:?})"));
+            Ok(())
+        }
+    }
+
+    /// Runs `sequence` and returns what was typed, without the lookups.
+    async fn typed(sequence: &str) -> Vec<String> {
+        let log = Log::default();
+        run(&parse(sequence).unwrap(), &fields(&log), &mut Recorder(&log), 8).await.unwrap();
+        log.take().into_iter().filter(|line| !line.starts_with("field(")).collect()
     }
 
     fn text(s: &str) -> Token {
         Token::Text(Zeroizing::new(s.into()))
     }
 
+    fn field(name: &str) -> Token {
+        Token::Field(name.into())
+    }
+
     fn key(name: &'static str) -> Token {
         Token::Key { name, mods: vec![], repeat: 1 }
     }
 
-    #[test]
-    fn default_sequence() {
-        let tokens = parse("{USERNAME}{TAB}{PASSWORD}{ENTER}", &fields()).unwrap();
+    #[tokio::test]
+    async fn default_sequence() {
+        let tokens = parse("{USERNAME}{TAB}{PASSWORD}{ENTER}").unwrap();
+        // Parsing takes no value: a placeholder stays a name.
+        assert_eq!(tokens, [field("USERNAME"), key("Tab"), field("PASSWORD"), key("Return")]);
         // Special characters inside field values are typed literally.
-        assert_eq!(tokens, [text("madev"), key("Tab"), text("p@ss{}~+"), key("Return")]);
+        assert_eq!(
+            typed("{USERNAME}{TAB}{PASSWORD}{ENTER}").await,
+            ["text(madev,8)", "key(Tab,[],1)", "text(p@ss{}~+,8)", "key(Return,[],1)"]
+        );
     }
 
     #[test]
     fn keys_repeats_delays_and_case() {
-        let tokens = parse("{username}{tab 2}{Delay 300}{DELAY=50}{S:PIN}~", &fields()).unwrap();
+        let tokens = parse("{username}{tab 2}{Delay 300}{DELAY=50}{S:PIN}~").unwrap();
         assert_eq!(
             tokens,
             [
-                text("madev"),
+                field("USERNAME"),
                 Token::Key { name: "Tab", mods: vec![], repeat: 2 },
                 Token::Delay(300),
                 Token::SetKeyDelay(50),
-                text("4321"),
+                field("S:PIN"),
                 key("Return"),
             ]
         );
@@ -495,7 +608,7 @@ mod tests {
 
     #[test]
     fn modifiers_and_literals() {
-        let tokens = parse("^a+{TAB}x{+}{{}{}}y", &fields()).unwrap();
+        let tokens = parse("^a+{TAB}x{+}{{}{}}y").unwrap();
         assert_eq!(
             tokens,
             [
@@ -504,33 +617,33 @@ mod tests {
                 text("x+{}y"),
             ]
         );
-        let tokens = parse("{CLEARFIELD}{TOTP}", &fields()).unwrap();
+        let tokens = parse("{CLEARFIELD}{TOTP}").unwrap();
         assert_eq!(
             tokens,
             [
                 Token::Key { name: "a", mods: vec![Modifier::Ctrl], repeat: 1 },
                 key("BackSpace"),
-                text("123456"),
+                field("TOTP")
             ]
         );
     }
 
-    #[test]
-    fn missing_fields_are_skipped_and_errors_reported() {
-        assert_eq!(parse("{URL}{TAB}", &fields()).unwrap(), [key("Tab")]);
-        assert!(parse("{PICKCHARS}", &fields()).unwrap_err().contains("Unsupported"));
-        assert!(parse("{USERNAME", &fields()).is_err());
-        assert!(parse("{DELAY x}", &fields()).is_err());
+    #[tokio::test]
+    async fn missing_fields_are_skipped_and_errors_reported() {
+        assert_eq!(typed("{URL}{TAB}").await, ["key(Tab,[],1)"]);
+        assert!(parse("{PICKCHARS}").unwrap_err().contains("Unsupported"));
+        assert!(parse("{USERNAME").is_err());
+        assert!(parse("{DELAY x}").is_err());
     }
 
     #[test]
     fn modifiers_before_fields_are_refused() {
         for sequence in ["+{PASSWORD}", "^{USERNAME}{TAB}", "+{S:PIN}", "{TAB}+{TOTP}"] {
-            let err = parse(sequence, &fields()).unwrap_err();
+            let err = parse(sequence).unwrap_err();
             assert!(err.contains("Modifiers before a field"), "{sequence}: {err}");
         }
         // Modifiers on keys and literal characters still work.
-        assert!(parse("^a+{TAB}{PASSWORD}", &fields()).is_ok());
+        assert!(parse("^a+{TAB}{PASSWORD}").is_ok());
     }
 
     #[test]
@@ -538,10 +651,10 @@ mod tests {
         // A sequence from a shared database must not be able to Alt-Tab or open a launcher
         // before typing the password.
         for sequence in ["%{TAB}{PASSWORD}", "%a", "{WIN}", "{LWIN}r", "{RWIN}"] {
-            assert!(parse(sequence, &fields()).is_err(), "{sequence}");
+            assert!(parse(sequence).is_err(), "{sequence}");
         }
-        assert!(parse("{%}", &fields()).is_ok());
-        assert!(parse(&"{TAB}".repeat(1000), &fields()).is_err(), "too long");
+        assert!(parse("{%}").is_ok());
+        assert!(parse(&"{TAB}".repeat(1000)).is_err(), "too long");
     }
 
     struct Long(usize);
@@ -554,56 +667,70 @@ mod tests {
 
     #[tokio::test]
     async fn long_text_is_chunked_and_capped() {
-        let tokens = parse("{NOTES}", &Long(150)).unwrap();
-        let mut rec = Recorder::default();
-        run(&tokens, &mut rec, 8, || true).await.unwrap();
-        let lens: Vec<usize> = rec.0.iter().map(|s| s.len() - "text(,8)".len()).collect();
+        let log = Log::default();
+        run(&parse("{NOTES}").unwrap(), &Long(150), &mut Recorder(&log), 8).await.unwrap();
+        let lens: Vec<usize> = log.take().iter().map(|s| s.len() - "text(,8)".len()).collect();
         assert_eq!(lens, [64, 64, 22]);
 
-        let tokens = parse("{NOTES}{NOTES}", &Long(5000)).unwrap();
-        let mut rec = Recorder::default();
-        let err = run(&tokens, &mut rec, 8, || true).await.unwrap_err();
+        let err =
+            run(&parse("{NOTES}{NOTES}").unwrap(), &Long(5000), &mut Recorder(&log), 8).await.unwrap_err();
         assert!(err.contains("too much text"), "{err}");
-    }
-
-    #[derive(Default)]
-    struct Recorder(Vec<String>);
-
-    impl Typist for Recorder {
-        async fn text(&mut self, text: &str, key_delay: u64) -> Result<(), String> {
-            self.0.push(format!("text({text},{key_delay})"));
-            Ok(())
-        }
-        async fn key(&mut self, name: &str, mods: &[Modifier], repeat: u32) -> Result<(), String> {
-            self.0.push(format!("key({name},{mods:?},{repeat})"));
-            Ok(())
-        }
-        async fn chord(&mut self, text: char, mods: &[Modifier]) -> Result<(), String> {
-            self.0.push(format!("chord({text},{mods:?})"));
-            Ok(())
-        }
     }
 
     #[tokio::test]
     async fn runs_tokens_in_order() {
-        let tokens = parse("{USERNAME}{DELAY=3}{TAB}{PASSWORD}", &fields()).unwrap();
-        let mut rec = Recorder::default();
-        run(&tokens, &mut rec, 8, || true).await.unwrap();
-        assert_eq!(rec.0, ["text(madev,8)", "key(Tab,[],1)", "text(p@ss{}~+,3)"]);
+        assert_eq!(
+            typed("{USERNAME}{DELAY=3}{TAB}{PASSWORD}").await,
+            ["text(madev,8)", "key(Tab,[],1)", "text(p@ss{}~+,3)"]
+        );
     }
 
+    /// Polls `future` once.
+    async fn poll_once<F: Future + Unpin>(future: &mut F) -> std::task::Poll<F::Output> {
+        std::future::poll_fn(|cx| std::task::Poll::Ready(std::pin::Pin::new(&mut *future).poll(cx))).await
+    }
+
+    /// A value is taken when it is about to be typed, so a pause before it passes without it,
+    /// and stopping in the pause (dropping the future, which is what a lock does) means it was
+    /// never taken at all.
     #[tokio::test]
-    async fn stops_before_the_next_token_once_cancelled() {
-        let tokens = parse("{USERNAME}{TAB}{PASSWORD}{ENTER}", &fields()).unwrap();
-        let mut rec = Recorder::default();
-        // "Locked" after the username and Tab went out.
-        let asked = std::cell::Cell::new(0);
-        let keep_going = || {
-            asked.set(asked.get() + 1);
-            asked.get() <= 3 // token, its one chunk, Tab
-        };
-        assert_eq!(run(&tokens, &mut rec, 8, keep_going).await, Err(CANCELLED.to_string()));
-        assert_eq!(rec.0, ["text(madev,8)", "key(Tab,[],1)"]);
+    async fn a_field_is_looked_up_only_when_its_turn_comes() {
+        let log = Log::default();
+        let tokens = parse("{USERNAME}{TAB}{DELAY 50}{PASSWORD}{ENTER}").unwrap();
+        let map = fields(&log);
+        {
+            let mut recorder = Recorder(&log);
+            let mut typing = std::pin::pin!(run(&tokens, &map, &mut recorder, 8));
+            // As far as it gets without waiting: up to the pause.
+            assert!(poll_once(&mut typing).await.is_pending());
+            assert_eq!(log.take(), ["field(USERNAME)", "text(madev,8)", "key(Tab,[],1)"]);
+            typing.await.unwrap();
+            assert_eq!(log.take(), ["field(PASSWORD)", "text(p@ss{}~+,8)", "key(Return,[],1)"]);
+        }
+        let mut recorder = Recorder(&log);
+        let mut typing = std::pin::pin!(run(&tokens, &map, &mut recorder, 8));
+        assert!(poll_once(&mut typing).await.is_pending());
+        log.take();
+        // Nothing follows from a future that is not polled again, which is all that dropping
+        // it comes to.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(log.take(), [] as [&str; 0]);
+    }
+
+    /// One `wtype` is handed no more than it types in half a second, however slowly the keys
+    /// are set to go, because that is how long it types on after a lock.
+    #[test]
+    fn a_burst_is_short_in_time() {
+        let wtype = Wtype::new(&Tracker::default());
+        for key_delay in [0, 8, 50, 200, 1000] {
+            let burst = wtype.burst(key_delay).clamp(1, MAX_BURST_CHARS);
+            let longest = typing_time(burst as u64, key_delay);
+            assert!(
+                longest <= Duration::from_millis(BURST_MILLIS.max(key_delay + KEY_MILLIS)),
+                "{key_delay}"
+            );
+        }
+        assert_eq!([0, 8, 200, 1000].map(|d| wtype.burst(d).clamp(1, MAX_BURST_CHARS)), [64, 41, 2, 1]);
     }
 
     #[test]

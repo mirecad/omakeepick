@@ -1,0 +1,3 @@
+#!/bin/bash
+# Stands in for `hyprctl activewindow -j` in the tests.
+echo "{\"xwayland\": ${FAKE_XWAYLAND:-false}}"

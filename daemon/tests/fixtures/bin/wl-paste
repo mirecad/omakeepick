@@ -1,0 +1,11 @@
+#!/bin/bash
+# Stands in for wl-paste in the tests: prints the copy a clipboard manager kept, or else what
+# the wl-copy stand-in holds while it is alive.
+if [[ -e $FAKE_DIR/kept ]]; then
+  cat "$FAKE_DIR/kept"
+elif [[ -e $FAKE_DIR/clipboard.pid ]] && kill -0 "$(< "$FAKE_DIR/clipboard.pid")" 2>/dev/null; then
+  cat "$FAKE_DIR/clipboard"
+else
+  echo "Nothing is copied" >&2
+  exit 1
+fi

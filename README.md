@@ -118,10 +118,10 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
 - After 3 wrong PINs, after suspend or hibernate, or after *Close database*, the PIN no longer
   works and you need the master password.
 - A lock always wins. If the screen locks or the machine suspends while an unlock is still
-  running, that unlock is stopped and the database stays locked. Auto-type in progress stops,
-  and a value copied at that moment is cleared. Before suspend, the daemon holds the system
-  back for a few seconds at most until this is done, and once a suspend has started nothing
-  can be unlocked until the machine is awake again.
+  running, that unlock is stopped and the database stays locked. Auto-type in progress stops
+  within half a second, and a copied value is taken off the clipboard at once. Before suspend,
+  the daemon holds the system back for a few seconds at most until this is done, and once a
+  suspend has started nothing can be unlocked until the machine is awake again.
 
 ### Settings
 
@@ -159,7 +159,7 @@ The syntax is the KeePass/KeePassXC subset that matters for logins:
   sequence is limited to 4096 characters and types at most 8192 characters.
 
 In XWayland windows (old Electron and Java apps), text is pasted via the clipboard instead of
-typed. The clipboard is cleared afterwards.
+typed. Each piece is on the clipboard only for its paste.
 
 TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), KeePass 2's
 `TimeOtp-*` fields and the legacy `TOTP Seed`/`TOTP Settings` fields.
@@ -199,6 +199,28 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     the image. (A helper that the kernel cannot kill at once is one stuck in a file read,
     which is before it was given the password.) The helper dies with the daemon too, and a parser crash on a malformed file
     takes down the helper, not the daemon.
+  - Copying and typing hold as little as they can, and a lock ends them wherever they are.
+    - Auto-type takes a field's value from the database when that field's turn comes, and
+      drops it once it is typed. The wait before typing, a `{DELAY}` and the key presses in
+      between pass with no secret in hand. A lock drops what the action has at that moment,
+      in the middle of a pause as much as in the middle of a password.
+    - `wtype` is handed text in short bursts: no more than it types in half a second (41
+      characters at the default speed, one at a time if you set keys slower than that). It
+      reads all of its input before it types any, and it is deliberately not killed on a
+      lock, because between a key press and its release that would leave the key held down
+      in your window. So after a lock it types the burst it has, and that is all.
+    - A copied value is held by a `wl-copy` that stays the daemon's own child (`wl-copy
+      --foreground`), with its buffer file in the daemon's runtime directory, not in `/tmp`.
+      That process is the clipboard entry: clearing it is killing it, which the daemon does
+      itself, at once, on a lock, when the clear timer runs out and when it exits. Nothing
+      else has to answer for the value to be gone, and the clipboard is never read back to
+      check. Two limits: `wl-copy` ends on its own as soon as you copy something else, and a
+      clipboard manager that keeps copies in spite of the "sensitive" hint has its own copy.
+      Omarchy's clipboard history honours the hint. For a manager that takes the selection
+      over, the daemon still looks for its value there and clears it, as far as that manager
+      and the compositor answer.
+    - Before a suspend the daemon waits until all of these are gone, and a `wtype` that is
+      still typing when logind's time is up is killed.
   - That covers the database and the key file, which can be on network or removable storage.
     The daemon's own files are another matter: its binary, its log and its state file live in
     your home directory, and if that is a network mount that hangs, the daemon hangs with it,
@@ -216,7 +238,7 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
   read its memory can try PINs offline, and a 4-digit PIN falls in minutes. So the PIN is only
   as strong as this process's memory isolation. If that worries you, don't set one.
 - **What "locked" means.** Locking drops the decrypted database, the key material and the
-  clipboard value. Live secrets are wiped where the code holds them; memory that the parser
+  clipboard value, and ends a copy or auto-type that was running. Live secrets are wiped where the code holds them; memory that the parser
   library freed on its own while the database was open is not scrubbed, which on Omarchy
   matters little because swap, and so a hibernation image, is inside the encrypted disk.
 - **Not stored anywhere:** passwords or PINs. `~/.local/state/omakeepick/state.json` holds

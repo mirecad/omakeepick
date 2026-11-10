@@ -1,0 +1,22 @@
+#!/bin/bash
+# Stands in for wtype in the tests. Records each run's arguments in $FAKE_DIR/wtype.log. Asked
+# to type its stdin (a last argument of `-`), it reads all of it first, like the real one, and
+# then appends it to $FAKE_DIR/typed one character at a time, FAKE_KEY_SECONDS apart.
+
+# What the selection $1 holds: something only while the wl-copy stand-in that offered it lives.
+held() {
+  [[ -e $FAKE_DIR/$1.pid ]] && kill -0 "$(< "$FAKE_DIR/$1.pid")" 2>/dev/null && cat "$FAKE_DIR/$1"
+}
+
+printf '%s\n' "$*" >> "$FAKE_DIR/wtype.log"
+if [[ " $* " == *" Insert "* ]]; then
+  # A paste: note what the application would have got.
+  printf 'pasted %s|%s\n' "$(held clipboard)" "$(held primary)" >> "$FAKE_DIR/wtype.log"
+fi
+[[ ${!#} == - ]] || exit 0
+text=$(cat; printf .)
+text=${text%.}
+for ((i = 0; i < ${#text}; i++)); do
+  printf '%s' "${text:i:1}" >> "$FAKE_DIR/typed"
+  sleep "${FAKE_KEY_SECONDS:-0}"
+done

@@ -106,15 +106,24 @@ daemon drops the credentials, kills the helper process that reads the files and 
 key, and the request fails with `cancelled` at once, whether the helper was deriving or stuck
 reading a file; the state stays as the lock left it. A quick unlock cancelled by a lock that keeps the PIN (manual,
 idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether the PIN was right
-(`cancelled`) or wrong (`no_quick_unlock`). The same holds for `act`: auto-type stops before
-the next token once a lock happened, and a copy that lands on the clipboard after a lock is
-cleared again; both fail with `cancelled`. A reload that was reading the file is killed too.
+(`cancelled`) or wrong (`no_quick_unlock`). A reload that was reading the file is killed too.
+
+The same holds for `act`, which fails with `cancelled` at once wherever a lock finds it: in
+the wait before typing, in a `{DELAY}`, while a value is typed or pasted, or while `wl-copy`
+is taking one. An auto-type holds a field's value only while that field is being typed, so in
+a pause it has none. The value in hand is dropped with the request; a `wtype` that is typing
+is not killed (it could leave a key held down) and types the burst it was given, at most half
+a second's worth, or a single key if keys are set slower than that. A copied value is taken off
+the clipboard by the lock itself, by killing the `wl-copy` that holds it.
+
 An unlock whose database or key file cannot be read within 30 s fails with `failed`.
 From the moment logind announces a sleep until it reports the wake-up, `unlock` and
 `quickUnlock` are refused with `cancelled`: such a request starts after the sleep's lock, which
 therefore could not stop it.
-Before suspend the daemon waits for such requests to end before letting the system sleep, for as
-long as logind's `InhibitDelayMaxSec` allows; on exit, for up to 2 s.
+Before suspend the daemon waits until all of that is over (the requests have ended, the helper
+and the tools they started are gone) before it lets the system sleep, for as long as logind's
+`InhibitDelayMaxSec` allows; a `wtype` still typing at the end of that time is killed. On exit
+it waits the same way for up to 2 s.
 
 ### Entry (search result)
 
@@ -142,7 +151,7 @@ Never contains secrets: no password, notes, custom field values or TOTP secret.
 |---|---|
 | `autotype` | waits `autotypeStartDelayMs` (so the overlay can hide and focus return), then types the entry's auto-type sequence into the focused window |
 | `typePassword` | same, but types only `{PASSWORD}` |
-| `copyUsername`, `copyPassword`, `copyUrl`, `copyTotp` | copies the value with `wl-copy --sensitive`; clears the clipboard after `clipboardClearSeconds` if it still holds that value |
+| `copyUsername`, `copyPassword`, `copyUrl`, `copyTotp` | copies the value with a `wl-copy --foreground --sensitive` that the daemon keeps as its child, and kills it after `clipboardClearSeconds`, or on a lock, unless something else was copied by then (which ends it anyway) |
 
 The client must hide the overlay **before** sending `autotype` / `typePassword`.
 

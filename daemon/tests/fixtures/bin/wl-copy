@@ -1,0 +1,34 @@
+#!/bin/bash
+# Stands in for wl-copy in the tests. Like the real one with --foreground, it takes its stdin
+# into a file under $TMPDIR and then stays for as long as it owns the selection. The selection
+# is the file $FAKE_DIR/clipboard (or primary), which counts only while the process named in
+# the .pid file next to it is alive. FAKE_WL_COPY makes it misbehave:
+#   stalls      never gets as far as reading its stdin (a compositor that does not answer)
+#   fails       cannot reach the compositor at all
+#   taken-over  loses the selection at once to a clipboard manager, which keeps a copy
+args=" $* "
+if [[ $args == *" --version "* ]]; then
+  # Before 2.3 there was no --sensitive, and an unknown option is an error.
+  [[ -n ${FAKE_OLD_WL_COPY:-} && $args == *" --sensitive "* ]] && exit 1
+  exit 0
+fi
+which=clipboard
+[[ $args == *" --primary "* ]] && which=primary
+if [[ $args == *" --clear "* ]]; then
+  printf 'clear %s\n' "$which" >> "$FAKE_DIR/wl-copy.log"
+  rm -f "$FAKE_DIR/$which" "$FAKE_DIR/$which.pid" "$FAKE_DIR/kept"
+  exit 0
+fi
+case ${FAKE_WL_COPY:-} in
+  stalls) exec sleep 600 ;;
+  fails) exit 1 ;;
+esac
+cat > "$TMPDIR/buffer" || exit 1
+cp "$TMPDIR/buffer" "$FAKE_DIR/$which"
+echo $$ > "$FAKE_DIR/$which.pid"
+printf 'offer %s\n' "$*" >> "$FAKE_DIR/wl-copy.log"
+if [[ ${FAKE_WL_COPY:-} == taken-over ]]; then
+  cp "$TMPDIR/buffer" "$FAKE_DIR/kept"
+  exit 0
+fi
+exec sleep 600

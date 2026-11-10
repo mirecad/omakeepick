@@ -2,7 +2,6 @@
 
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +14,7 @@ use zeroize::Zeroizing;
 use crate::autotype::{self, Fields, PasteTypist, Wtype};
 use crate::clipboard::Clipboard;
 use crate::config::Settings;
+use crate::inflight::Tracker;
 use crate::opener::Opener;
 use crate::protocol::{ApiError, Reply, args, ok, ok_with};
 use crate::quickunlock::{self, QuickBlob};
@@ -101,6 +101,10 @@ const READ_TOO_LONG: &str = "Reading the database or the key file took too long 
 /// helper that `SIGKILL` has not ended by then is stuck in a file read the kernel will not
 /// interrupt, for as long as the file system stays silent.
 const STUCK_HELPER_GRACE: Duration = Duration::from_secs(1);
+
+/// The end of the time `lock_and_settle` has, kept for killing what was being left to end by
+/// itself and has not.
+const LAST_MOMENT: Duration = Duration::from_millis(200);
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_ATOMS: usize = 16;
@@ -299,8 +303,45 @@ impl Fields for EntryFields<'_> {
     }
 }
 
+impl EntryFields<'_> {
+    /// Whether `name` can be typed. A field that is missing types nothing, which is fine; the
+    /// one that can fail is a TOTP whose settings do not make a code. Found out before anything
+    /// is typed, and without taking any other field's value.
+    fn check(&self, name: &str) -> Result<(), String> {
+        match name {
+            "TOTP" => self.field(name).map(drop),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Resolves auto-type placeholders against the open database at the moment each is typed, for
+/// an action that began under `epoch`.
+struct LiveFields<'a> {
+    daemon: &'a Daemon,
+    entry: &'a str,
+    epoch: u64,
+}
+
+impl Fields for LiveFields<'_> {
+    fn field(&self, name: &str) -> Result<Option<Zeroizing<String>>, String> {
+        let core = self.daemon.core();
+        // After a lock there is nothing to read, and a database unlocked since is not the one
+        // this action was asked for.
+        let Some(open) = core.open.as_ref().filter(|_| core.epoch == self.epoch) else {
+            return Err(autotype::CANCELLED.into());
+        };
+        // A reload can have taken the entry away.
+        let entry = open.entry(self.entry).ok_or("The entry no longer exists")?;
+        EntryFields(&entry).field(name)
+    }
+}
+
 enum Prepared {
+    /// The value to copy. It goes straight to the clipboard.
     Copy { value: Zeroizing<String>, what: &'static str },
+    /// The sequence to type. It names the fields; their values stay in the database until each
+    /// is typed.
     Type { tokens: Vec<autotype::Token> },
 }
 
@@ -332,35 +373,17 @@ pub struct Daemon {
     quit: Notify,
     clipboard: Clipboard,
     reload_tx: mpsc::UnboundedSender<()>,
-    /// Whatever holds secrets outside `core`: unlocks, reloads, copies and auto-type, and
-    /// helpers that were killed but are not reaped yet. `lock_and_settle` waits for them, so
-    /// suspend is not allowed while they exist.
-    inflight: AtomicUsize,
-    settled: Notify,
-}
-
-/// Counts one holder in `Daemon::inflight` while it exists.
-struct Inflight(Arc<Daemon>);
-
-impl Inflight {
-    fn new(daemon: &Arc<Daemon>) -> Self {
-        daemon.inflight.fetch_add(1, Ordering::SeqCst);
-        Inflight(daemon.clone())
-    }
-}
-
-impl Drop for Inflight {
-    fn drop(&mut self) {
-        if self.0.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
-            self.0.settled.notify_waiters();
-        }
-    }
+    /// Whatever has secrets in hand outside `core`: unlocks, reloads, copies and auto-type
+    /// while they run, and the helpers and tools they started until those are gone.
+    /// `lock_and_settle` waits for all of it, so suspend is not allowed while any exists.
+    inflight: Tracker,
 }
 
 impl Daemon {
     pub fn new(state_dir: &Path) -> (Arc<Daemon>, mpsc::UnboundedReceiver<()>) {
         let (events, _) = broadcast::channel(64);
         let (reload_tx, reload_rx) = mpsc::unbounded_channel();
+        let inflight = Tracker::default();
         let daemon = Daemon {
             core: Mutex::new(Core {
                 settings: Settings::default(),
@@ -381,10 +404,9 @@ impl Daemon {
             events,
             idle_wakeup: Notify::new(),
             quit: Notify::new(),
-            clipboard: Clipboard::default(),
+            clipboard: Clipboard::new(inflight.clone()),
             reload_tx,
-            inflight: AtomicUsize::new(0),
-            settled: Notify::new(),
+            inflight,
         };
         (Arc::new(daemon), reload_rx)
     }
@@ -440,44 +462,46 @@ impl Daemon {
         self.core().sleeping = false;
     }
 
-    /// Locks right away. The clipboard clear runs in the background; `lock_and_settle` waits
-    /// for it.
-    pub fn lock(self: &Arc<Self>, reason: LockReason) -> Option<tokio::task::JoinHandle<()>> {
+    /// Locks right away. Everything a lock does happens in here and waits for nothing: the
+    /// database and the keys are wiped, whatever was running is told to stop (it watches the
+    /// epoch), and the `wl-copy` holding a copied value is killed. Returns whether anything
+    /// changed.
+    pub fn lock(self: &Arc<Self>, reason: LockReason) -> bool {
         let changed = self.core().lock(reason);
-        if !changed {
-            return None;
+        // Whatever the lock found to do: a copied value does not outlive it.
+        self.clipboard.forget();
+        if changed {
+            eprintln!("omakeepickd: locked ({})", reason.as_str());
+            self.emit_state();
         }
-        eprintln!("omakeepickd: locked ({})", reason.as_str());
-        self.emit_state();
-        let daemon = self.clone();
-        Some(tokio::spawn(async move { daemon.clipboard.clear_now().await }))
+        changed
     }
 
-    /// Locks, then waits (at most `limit`) until the clipboard is cleared and no request still
-    /// holds secrets outside `core`. Used before suspend and on exit, where "locked" has to mean
-    /// that nothing decrypted is left in RAM or on the clipboard.
+    /// Locks, then waits (at most `limit`) until nothing has secrets in hand outside `core` any
+    /// more. Used before suspend and on exit, where "locked" has to mean that nothing decrypted
+    /// is left in RAM or on the clipboard.
+    ///
+    /// The lock itself has dropped and wiped everything by the time this waits. What it waits
+    /// for is the unwinding: tasks that have yet to run and return, and processes that were
+    /// killed, or told to stop, and are not reaped yet.
     pub async fn lock_and_settle(self: &Arc<Self>, reason: LockReason, limit: Duration) {
-        let deadline = Instant::now() + limit;
-        let clear = self.lock(reason);
-        let settle = async {
-            if let Some(clear) = clear {
-                let _ = clear.await;
-            }
-            loop {
-                let waiting = self.settled.notified();
-                if self.inflight.load(Ordering::SeqCst) == 0 {
-                    return;
-                }
-                waiting.await;
-            }
-        };
-        if tokio::time::timeout_at(deadline.into(), settle).await.is_err() {
-            // An unlock or reload dropped what it held when the lock happened, and its helper
-            // was killed. What is left is a copy or auto-type that `wl-copy` or `wtype` is
-            // still busy with; its result is discarded either way.
+        self.lock(reason);
+        let patience = limit.saturating_sub(LAST_MOMENT);
+        if tokio::time::timeout(patience, self.inflight.settled()).await.is_ok() {
+            return;
+        }
+        // A `wtype` that is still typing the burst it had is killed now rather than left to
+        // finish.
+        self.inflight.hurry();
+        if tokio::time::timeout(LAST_MOMENT, self.inflight.settled()).await.is_err() {
+            // None of what can be left here answers to a lock, or to a signal: fixed-cost work
+            // of our own that is still on a thread (the PIN's Argon2id, taking a hand-over
+            // apart), a helper the kernel cannot end because it is stuck in a file read (it
+            // has no credential), or the search for a copied value that a clipboard manager
+            // took over.
             eprintln!(
                 "omakeepickd: {} task(s) still not finished {:.1}s after locking",
-                self.inflight.load(Ordering::SeqCst),
+                self.inflight.count(),
                 limit.as_secs_f64()
             );
         }
@@ -580,7 +604,7 @@ impl Daemon {
     fn discard(self: &Arc<Self>, opener: Opener) {
         let given = opener.was_given_credentials();
         let gone = opener.kill();
-        let unsettled = Inflight::new(self);
+        let unsettled = self.inflight.hold();
         tokio::spawn(async move {
             tokio::pin!(gone);
             if given {
@@ -658,10 +682,9 @@ impl Daemon {
                 let had_locked = core.locked.take().is_some();
                 core.lock_reason = Some(LockReason::Closed);
                 drop(core);
+                self.clipboard.forget();
                 if had_open || had_locked {
                     self.emit_state();
-                    let daemon = self.clone();
-                    tokio::spawn(async move { daemon.clipboard.clear_now().await });
                 }
                 ok()
             }
@@ -756,6 +779,10 @@ impl Daemon {
         ApiError::new("cancelled", "Locked before the unlock finished")
     }
 
+    fn interrupted() -> ApiError {
+        ApiError::new("cancelled", "Locked before the action finished")
+    }
+
     fn going_to_sleep_error() -> ApiError {
         ApiError::new("cancelled", "The computer is going to sleep")
     }
@@ -798,7 +825,7 @@ impl Daemon {
             return Err(VaultError::no_credentials().into());
         }
         let epoch = self.begin_busy()?;
-        let _inflight = Inflight::new(self);
+        let _inflight = self.inflight.hold();
         #[cfg(debug_assertions)]
         let _ = tokio::task::spawn_blocking(|| test_hold("OMAKEEPICK_TEST_HOLD")).await;
         // The password alone. The key file is read by the helper, before it is given this, and
@@ -867,7 +894,7 @@ impl Daemon {
             core.busy = true;
             taken
         };
-        let _inflight = Inflight::new(self);
+        let _inflight = self.inflight.hold();
         self.emit_state();
         let p = path.clone();
         // The PIN check is a fixed-cost Argon2id of our own; the database's derivation, whose
@@ -961,7 +988,8 @@ impl Daemon {
         }
     }
 
-    /// Resolves an action's secrets. Returns the epoch too: the caller stops if it changes.
+    /// Checks an action and takes what it needs at once: for a copy the value, for auto-type
+    /// only the sequence. Returns the epoch too: the action ends if it changes.
     fn prepare(&self, a: &ActArgs) -> Result<(Prepared, u64), ApiError> {
         let mut guard = self.core();
         let core = &mut *guard;
@@ -996,7 +1024,13 @@ impl Daemon {
                 } else {
                     "{PASSWORD}".to_string()
                 };
-                let tokens = autotype::parse(&sequence, &fields).map_err(|e| ApiError::new("failed", e))?;
+                let failed = |e| ApiError::new("failed", e);
+                let tokens = autotype::parse(&sequence).map_err(failed)?;
+                for token in &tokens {
+                    if let autotype::Token::Field(name) = token {
+                        fields.check(name).map_err(failed)?;
+                    }
+                }
                 Prepared::Type { tokens }
             }
             other => return Err(ApiError::bad_request(format!("Unknown action {other}"))),
@@ -1012,9 +1046,12 @@ impl Daemon {
         self.core().epoch == epoch
     }
 
+    /// Copies or types. Whatever of the database an action has in hand lives in one future,
+    /// and that future is raced against a lock: a lock drops it wherever it is, which wipes
+    /// the value and ends the tool that had a piece of it (see `tool`).
     async fn act(self: &Arc<Self>, a: ActArgs) -> Reply {
         let (prepared, epoch) = self.prepare(&a)?;
-        let _inflight = Inflight::new(self);
+        let _inflight = self.inflight.hold();
         self.emit_state();
         let (settings, ttl) = {
             let core = self.core();
@@ -1022,16 +1059,22 @@ impl Daemon {
         };
         let tool_error = |e: String| match e.strip_prefix("tool_missing:") {
             Some(msg) => ApiError::new("tool_missing", msg),
-            None if e == autotype::CANCELLED => Self::cancelled(),
+            None if e == autotype::CANCELLED => Self::interrupted(),
             None => ApiError::new("failed", e),
         };
         match prepared {
             Prepared::Copy { value, what } => {
-                let ticket = self.clipboard.copy(value.as_bytes()).await.map_err(tool_error)?;
+                let copied = tokio::select! {
+                    biased;
+                    () = self.locked_since(epoch) => Err(autotype::CANCELLED.to_string()),
+                    copied = self.clipboard.copy(value) => copied,
+                };
+                let ticket = copied.map_err(tool_error)?;
                 if !self.still(epoch) {
-                    // Locked while wl-copy ran: the lock's own clear may have missed this value.
+                    // Locked in the instant the value landed, after the lock's own clear. By
+                    // its ticket: what somebody copied since is not this action's to take.
                     self.clipboard.clear_if_unchanged(ticket, Duration::ZERO).await;
-                    return Err(Self::cancelled());
+                    return Err(Self::interrupted());
                 }
                 if ttl > 0 {
                     let daemon = self.clone();
@@ -1042,20 +1085,29 @@ impl Daemon {
                 ok_with(json!({"clearsIn": ttl, "copied": what}))
             }
             Prepared::Type { tokens } => {
-                tokio::time::sleep(Duration::from_millis(u64::from(settings.autotype_start_delay_ms))).await;
-                let delay = u64::from(settings.type_delay_ms);
-                // A lock during the delay or mid-sequence stops the typing: the focused window
-                // may be the lock screen by now.
-                let keep_going = || self.still(epoch);
-                let result = if focused_is_xwayland().await {
-                    let mut typist = PasteTypist::default();
-                    let result = autotype::run(&tokens, &mut typist, delay, keep_going).await;
-                    typist.finish().await;
-                    result
-                } else {
-                    autotype::run(&tokens, &mut Wtype, delay, keep_going).await
+                let fields = LiveFields { daemon: self, entry: &a.entry, epoch };
+                let (clipboard, inflight) = (&self.clipboard, &self.inflight);
+                let typing = async move {
+                    // Nothing of the entry is in hand yet: the wait for focus to return and
+                    // the look at the focused window pass without a secret.
+                    tokio::time::sleep(Duration::from_millis(u64::from(settings.autotype_start_delay_ms)))
+                        .await;
+                    let delay = u64::from(settings.type_delay_ms);
+                    if focused_is_xwayland().await {
+                        autotype::run(&tokens, &fields, &mut PasteTypist::new(clipboard, inflight), delay)
+                            .await
+                    } else {
+                        autotype::run(&tokens, &fields, &mut Wtype::new(inflight), delay).await
+                    }
                 };
-                result.map_err(tool_error)?;
+                // A lock stops the typing where it is: the focused window may be the lock
+                // screen by now.
+                let typed = tokio::select! {
+                    biased;
+                    () = self.locked_since(epoch) => Err(autotype::CANCELLED.to_string()),
+                    typed = typing => typed,
+                };
+                typed.map_err(tool_error)?;
                 ok()
             }
         }
@@ -1102,7 +1154,7 @@ impl Daemon {
             let Some(open) = &core.open else { return };
             (open.path.clone(), core.open_stamp, core.epoch)
         };
-        let _inflight = Inflight::new(self);
+        let _inflight = self.inflight.hold();
         let mut last_error = None;
         let mut seen = None;
         // Writers that truncate-and-write can be caught mid-save; retry once.
@@ -1183,6 +1235,8 @@ async fn focused_is_xwayland() -> bool {
         .args(["activewindow", "-j"])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        // An action dropped while this is asked (a lock) takes it along.
+        .kill_on_drop(true)
         .output()
         .await
     else {

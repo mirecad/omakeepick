@@ -9,6 +9,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
 use omakeepickd::autotype::{self, Fields, Wtype};
+use omakeepickd::inflight::Tracker;
 use zeroize::Zeroizing;
 
 struct Entry(HashMap<&'static str, &'static str>);
@@ -39,10 +40,13 @@ async fn field_values_reach_wtype_on_stdin_only() {
 
     // A modifier before a field would type its first character as a chord; it is refused
     // before anything is typed.
-    assert!(autotype::parse("{USERNAME}{TAB}+{PASSWORD}", &entry).is_err());
+    assert!(autotype::parse("{USERNAME}{TAB}+{PASSWORD}").is_err());
 
-    let tokens = autotype::parse("^a{USERNAME}{TAB}{PASSWORD}{TAB}{TOTP}{ENTER}", &entry).unwrap();
-    autotype::run(&tokens, &mut Wtype, 0, || true).await.unwrap();
+    let tokens = autotype::parse("^a{USERNAME}{TAB}{PASSWORD}{TAB}{TOTP}{ENTER}").unwrap();
+    let inflight = Tracker::default();
+    autotype::run(&tokens, &entry, &mut Wtype::new(&inflight), 0).await.unwrap();
+    // Every wtype it started has been waited for.
+    assert_eq!(inflight.count(), 0);
 
     // Only flags, modifier and key names, delays, and the chord's own literal `a`.
     let args = fs::read_to_string(log.join("args")).unwrap();
