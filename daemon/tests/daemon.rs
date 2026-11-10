@@ -448,6 +448,105 @@ fn a_lock_kills_a_running_derivation() {
     wait_until("the helper is dead", || !is_alive(helper));
 }
 
+/// Reading the database or the key file can hang for as long as the file system likes (a
+/// network mount that stopped answering). The helper does the reading, before the daemon gives
+/// it any credential, so a lock neither waits for the read nor leaves the password with
+/// anything that is stuck in it.
+#[test]
+fn a_lock_does_not_wait_for_a_file_that_hangs() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    // With OMAKEEPICK_TEST_HOLD_READ (debug builds), the helper blocks on this FIFO where it
+    // would read the files. Nothing ever writes to it: the read never returns.
+    let fifo = env.dir.path().join("hold-read");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut serve = env.command(&["serve"]);
+    serve.env("OMAKEEPICK_TEST_HOLD_READ", &fifo);
+    let mut daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.dir.path().join("Secrets.kdbx");
+    std::fs::copy(fixture("password-keyfile.kdbx"), &db).unwrap();
+    let keyfile = fixture("password-keyfile.keyx");
+    let start_unlock = |conn: &mut Conn, daemon: &Daemon| {
+        conn.events.clear();
+        let unlock = json!({"db": db, "keyfile": keyfile, "password": PASSWORD, "pin": "2468"});
+        let id = conn.send("unlock", unlock);
+        conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
+        let mut helper = None;
+        wait_until("the helper has started", || {
+            helper = helper_of(daemon);
+            helper.is_some()
+        });
+        (id, helper.unwrap())
+    };
+
+    // Suspend: the unlock ends at once, the helper is killed, and the daemon is ready again.
+    let (id, helper) = start_unlock(&mut conn, &daemon);
+    let started = Instant::now();
+    assert_eq!(conn.request("lock", json!({"reason": "sleep"}))["ok"], true);
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    assert!(started.elapsed() < Duration::from_secs(5), "the lock waited for the read");
+    wait_until("the helper is dead", || !is_alive(helper));
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
+
+    // `quit` (which settles the same way suspend does) is not held up by it either.
+    let (_, helper) = start_unlock(&mut conn, &daemon);
+    assert_eq!(conn.request("quit", json!({}))["ok"], true);
+    wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
+    assert!(!is_alive(helper));
+}
+
+/// The daemon does not read the key file: the helper does, and hands its contents back with
+/// the database. Quick unlock and reloads then work from memory, without the file.
+#[test]
+fn a_key_file_is_read_by_the_helper_and_only_for_the_unlock() {
+    let env = Env::new();
+    let _daemon = env.serve();
+    let mut conn = env.connect();
+    let db = env.dir.path().join("Secrets.kdbx");
+    std::fs::copy(fixture("password-keyfile.kdbx"), &db).unwrap();
+    let keyfile = env.dir.path().join("Secrets.keyx");
+    std::fs::copy(fixture("password-keyfile.keyx"), &keyfile).unwrap();
+    let unlock = |conn: &mut Conn, keyfile: Option<&Path>, password: &str| {
+        conn.request("unlock", json!({"db": db, "keyfile": keyfile, "password": password, "pin": "2468"}))
+    };
+
+    assert_eq!(unlock(&mut conn, None, PASSWORD)["error"], "bad_credentials");
+    assert_eq!(unlock(&mut conn, Some(&env.dir.path().join("nope.keyx")), PASSWORD)["error"], "not_found");
+    assert_eq!(unlock(&mut conn, Some(env.dir.path()), PASSWORD)["error"], "keyfile_error");
+    assert_eq!(unlock(&mut conn, Some(&keyfile), "wrong")["error"], "bad_credentials");
+    assert_eq!(unlock(&mut conn, None, "")["error"], "bad_request");
+    assert_eq!(conn.state()["busy"], false);
+    assert_eq!(unlock(&mut conn, Some(&keyfile), PASSWORD)["ok"], true);
+    let state = conn.state();
+    assert_eq!((state["entryCount"].clone(), state["keyfile"].clone()), (json!(7), json!(keyfile)));
+
+    // The key file goes away, like a USB stick pulled out after unlocking.
+    let key = || {
+        DatabaseKey::new()
+            .with_password(PASSWORD)
+            .with_keyfile(&mut std::fs::File::open(fixture("password-keyfile.keyx")).unwrap())
+            .unwrap()
+    };
+    std::fs::remove_file(&keyfile).unwrap();
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 7);
+
+    // A changed database is reloaded with the key that is in memory.
+    let mut changed = Database::open(&mut std::fs::File::open(&db).unwrap(), key()).unwrap();
+    changed.config.version = keepass::config::DatabaseVersion::KDB4(1);
+    changed.root_mut().add_entry().set_unprotected("Title", "Brand new");
+    let tmp = db.with_extension("tmp");
+    changed.save(&mut std::fs::File::create(&tmp).unwrap(), key()).unwrap();
+    std::fs::rename(&tmp, &db).unwrap();
+    conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 8);
+}
+
 #[test]
 fn reloads_when_the_file_changes() {
     let env = Env::new();

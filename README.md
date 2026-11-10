@@ -185,13 +185,23 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     can't `ptrace` it or read its memory.
   - Its memory is not pinned, so while unlocked the kernel may swap it. Locking, including the
     automatic lock before suspend or hibernate, wipes the decrypted database first.
-  - The key derivation runs in a helper process (`omakeepickd open-db`, a second copy of the
-    same binary, hardened the same way). The master password and key file go to it on a pipe,
-    and the decrypted database comes back on one. A lock, suspend or exit while it is still
-    deriving kills it with `SIGKILL`, and the daemon waits until it is gone before it lets the
-    system sleep, so an unlock that was in flight when the machine hibernates leaves nothing in
-    the image. The helper dies with the daemon too, and a parser crash on a malformed file
+  - Reading the files and deriving the key both run in a helper process
+    (`omakeepickd open-db`, a second copy of the same binary, hardened the same way), because
+    neither can be interrupted from inside. A derivation takes as long as the file's header
+    says, and a file on a network share that stopped answering can hang forever. The helper
+    reads the database and the key file first. Only when that is done does the daemon send it
+    the master password on a pipe, and the decrypted database comes back on one. So nothing
+    ever waits on a file with a credential in hand, and the daemon itself never opens either
+    file. A lock, suspend or exit makes the daemon forget the password at once and kill the
+    helper with `SIGKILL`, and the daemon waits until the helper is gone before it lets the
+    system sleep. An unlock that was in flight when the machine hibernates leaves nothing in
+    the image. (A helper that the kernel cannot kill at once is one stuck in a file read,
+    which is before it was given the password.) The helper dies with the daemon too, and a parser crash on a malformed file
     takes down the helper, not the daemon.
+  - That covers the database and the key file, which can be on network or removable storage.
+    The daemon's own files are another matter: its binary, its log and its state file live in
+    your home directory, and if that is a network mount that hangs, the daemon hangs with it,
+    like the rest of your session.
 - **The prebuilt helper is pinned.** Each commit of the plugin names the SHA-256 of the one
   release binary it installs (`bin/omakeepickd.sha256`), so a release file swapped later is
   refused. From 0.1.1 on, release binaries also carry a GitHub build attestation, and
@@ -233,6 +243,11 @@ QML hot-reloads. The daemon protocol is documented in [docs/PROTOCOL.md](docs/PR
 `omakeepickd ctl status`, `ctl lock` and `ctl search '{"query":"git"}'` talk to it directly.
 The test databases in `daemon/tests/fixtures` come from `fixture.xml` via `make.sh`. Their
 password is `test-password`.
+
+One test is run by hand, because it hangs a file system on purpose:
+`daemon/tests/manual/hung-mount.py path/to/omakeepickd` mounts a small FUSE file system that
+stops answering (it needs `fusermount3`, not root) and shows what a suspend lock does to an
+unlock whose key file or database is stuck on it.
 
 **Releasing:**
 

@@ -160,7 +160,7 @@ async fn client(daemon: Arc<Daemon>, stream: UnixStream) {
         if Daemon::is_async(&header.cmd) {
             let (daemon, replies) = (daemon.clone(), replies.clone());
             tokio::spawn(async move {
-                let reply = daemon.handle_async(&header.cmd, &line).await;
+                let reply = daemon.handle_async(&header.cmd, line).await;
                 let _ = replies.send(encode_reply(header.id, reply)).await;
             });
         } else {

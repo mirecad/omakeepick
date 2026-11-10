@@ -169,9 +169,19 @@ fn totp_from_all_three_formats() {
     assert!(totp::current_code(&gitea).is_err());
 }
 
-/// Opens `path` the way the daemon does: in an `open-db` helper process.
-async fn open_in_helper(path: &Path, key: &KeyMaterial) -> Result<Database, VaultError> {
-    Opener::spawn(Path::new(BIN), path, key).await?.wait().await
+/// Opens `path` the way the daemon does: in an `open-db` helper process, which reads the files
+/// first and is given `key` after that.
+async fn open_in_helper(
+    path: &Path,
+    keyfile: Option<&Path>,
+    key: KeyMaterial,
+) -> Result<(Database, KeyMaterial), VaultError> {
+    let mut opener = Opener::spawn(Path::new(BIN), path, keyfile).await?;
+    opener.decrypt(key).await?.unseal()
+}
+
+fn password(password: &str) -> KeyMaterial {
+    KeyMaterial::from_password(Zeroizing::new(password.into()))
 }
 
 /// Everything in the database except the file-level settings the hand-over rewrites.
@@ -182,6 +192,7 @@ fn contents(db: &Database) -> serde_json::Value {
 }
 
 /// The helper hands the database over re-encrypted; nothing may be lost or changed on the way.
+/// With it come the credentials it used: the password it was given and the key file it read.
 #[tokio::test]
 async fn the_helper_hands_over_the_same_database() {
     let dir = tempfile::tempdir().unwrap();
@@ -197,19 +208,29 @@ async fn the_helper_hands_over_the_same_database() {
         OuterCipherConfig::ChaCha20,
     );
     let cases = [
-        (fixture("password.kdbx"), key(PASSWORD, None)),
-        (fixture("password-keyfile.kdbx"), key(PASSWORD, Some("password-keyfile.keyx"))),
-        (fixture("keyfile-only.kdbx"), key("", Some("raw.key"))),
-        (argon2id, key(PASSWORD, None)),
+        (fixture("password.kdbx"), PASSWORD, None),
+        (fixture("password-keyfile.kdbx"), PASSWORD, Some("password-keyfile.keyx")),
+        (fixture("keyfile-only.kdbx"), "", Some("raw.key")),
+        (argon2id, PASSWORD, None),
     ];
-    for (path, key) in cases {
-        let direct = vault::open_database(&path, &key).unwrap();
-        let handed_over =
-            open_in_helper(&path, &key).await.unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert_eq!(contents(&direct), contents(&handed_over), "{}", path.display());
+    for (path, pass, keyfile) in cases {
+        let whole = key(pass, keyfile);
+        let direct = vault::open_database(&path, &whole).unwrap();
+        // An unlock: the helper reads the key file and is given the password alone.
+        let (unlocked, used) = open_in_helper(&path, keyfile.map(fixture).as_deref(), password(pass))
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(used.to_bytes(), whole.to_bytes(), "{}", path.display());
+        assert_eq!(contents(&direct), contents(&unlocked), "{}", path.display());
+        // A quick unlock or a reload: the key from memory, and no key file to read.
+        let (reopened, used) = open_in_helper(&path, None, whole.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        assert_eq!(used.to_bytes(), whole.to_bytes(), "{}", path.display());
+        assert_eq!(contents(&direct), contents(&reopened), "{}", path.display());
         // And the daemon's view of it, which is what matters.
-        let direct = OpenDb::new(path.clone(), None, key.clone(), None, direct);
-        let handed_over = OpenDb::new(path.clone(), None, key, None, handed_over);
+        let direct = OpenDb::new(path.clone(), None, whole.clone(), None, direct);
+        let handed_over = OpenDb::new(path.clone(), None, whole, None, unlocked);
         assert_eq!(direct.index.len(), 7, "{}", path.display());
         for (a, b) in direct.index.iter().zip(&handed_over.index) {
             assert_eq!(
@@ -232,13 +253,76 @@ async fn the_helper_hands_over_the_same_database() {
 
 #[tokio::test]
 async fn the_helper_reports_errors_like_the_in_process_open() {
-    let bad = key("nope", None);
-    assert_eq!(open_in_helper(&fixture("password.kdbx"), &bad).await.err(), Some(VaultError::BadCredentials));
-    let missing = open_in_helper(&fixture("missing.kdbx"), &key(PASSWORD, None)).await;
-    assert!(matches!(missing, Err(VaultError::NotFound(_))), "{missing:?}");
-    let xml = open_in_helper(&fixture("fixture.xml"), &key(PASSWORD, None)).await;
-    assert!(matches!(xml, Err(VaultError::Format(_))), "{xml:?}");
+    let open = async |name: &str, keyfile: Option<&str>, pass: &str| {
+        open_in_helper(&fixture(name), keyfile.map(fixture).as_deref(), password(pass)).await.err()
+    };
+    assert_eq!(open("password.kdbx", None, "nope").await, Some(VaultError::BadCredentials));
+    assert_eq!(open("password-keyfile.kdbx", None, PASSWORD).await, Some(VaultError::BadCredentials));
+    assert_eq!(
+        open("password-keyfile.kdbx", Some("raw.key"), PASSWORD).await,
+        Some(VaultError::BadCredentials)
+    );
+    let missing = open("missing.kdbx", None, PASSWORD).await;
+    assert!(matches!(missing, Some(VaultError::NotFound(_))), "{missing:?}");
+    let xml = open("fixture.xml", None, PASSWORD).await;
+    assert!(matches!(xml, Some(VaultError::Format(_))), "{xml:?}");
+    // Neither a password nor a key file.
+    let nothing = open("password.kdbx", None, "").await;
+    assert!(matches!(nothing, Some(VaultError::BadRequest(_))), "{nothing:?}");
     // A helper that is not the daemon's binary cannot be started.
-    let spawn = Opener::spawn(Path::new("/nonexistent/omakeepickd"), &fixture("password.kdbx"), &bad).await;
-    assert!(matches!(spawn, Err(VaultError::Io(_))));
+    let spawn = Opener::spawn(Path::new("/nonexistent/omakeepickd"), &fixture("password.kdbx"), None).await;
+    assert!(matches!(spawn.err(), Some(VaultError::Io(_))));
+}
+
+/// The helper's half of the order that keeps credentials away from file reads, which can hang:
+/// it reads both files, and refuses what it can refuse, before it is given any credential.
+#[tokio::test]
+async fn the_helper_reads_the_files_before_it_is_given_credentials() {
+    let exe = Path::new(BIN);
+    let db = fixture("password-keyfile.kdbx");
+    let keyfile = fixture("password-keyfile.keyx");
+    // `spawn` takes no credentials, so none have been sent when `read` returns.
+    let mut opener = Opener::spawn(exe, &db, Some(&keyfile)).await.unwrap();
+    assert_eq!(opener.read().await.unwrap(), vault::read_database(&db).unwrap().1);
+    // Sent now, they open the database, and the key file's contents come back with it.
+    let (opened, used) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
+    assert_eq!(vault::build_index(&opened).len(), 7);
+    assert_eq!(used.to_bytes(), key(PASSWORD, Some("password-keyfile.keyx")).to_bytes());
+
+    // A key file or a database that cannot be read ends it there, credentials unsent.
+    let dir = tempfile::tempdir().unwrap();
+    let read = async |db: &Path, keyfile: Option<&Path>| {
+        Opener::spawn(exe, db, keyfile).await.unwrap().read().await.err()
+    };
+    let gone = fixture("missing.keyx");
+    assert_eq!(read(&db, Some(&gone)).await, Some(VaultError::NotFound(gone)));
+    let not_a_file = read(&db, Some(dir.path())).await;
+    assert!(matches!(not_a_file, Some(VaultError::Keyfile(_))), "{not_a_file:?}");
+    let gone = fixture("missing.kdbx");
+    assert_eq!(read(&gone, Some(&keyfile)).await, Some(VaultError::NotFound(gone)));
+
+    // So does a header that asks for a derivation without end (KDBX 3 field 6, the rounds).
+    let mut absurd = std::fs::read(fixture("password.kdbx")).unwrap();
+    let mut at = 12;
+    while absurd[at] != 6 {
+        at += 3 + u16::from_le_bytes([absurd[at + 1], absurd[at + 2]]) as usize;
+    }
+    absurd[at + 3..at + 11].copy_from_slice(&u64::MAX.to_le_bytes());
+    let path = dir.path().join("absurd.kdbx");
+    std::fs::write(&path, absurd).unwrap();
+    let refused = read(&path, None).await;
+    assert!(matches!(refused, Some(VaultError::Format(_))), "{refused:?}");
+}
+
+/// The daemon's half of that order: it writes no credential until the helper has reported the
+/// files as read. The stand-in helper here never does, and after a second reports how many
+/// bytes it was sent: the request naming the two files, and nothing else.
+#[tokio::test]
+async fn credentials_are_not_sent_before_the_files_are_read() {
+    let db = fixture("password-keyfile.kdbx");
+    let keyfile = fixture("password-keyfile.keyx");
+    let mut opener = Opener::spawn(&fixture("never-ready.sh"), &db, Some(&keyfile)).await.unwrap();
+    let outcome = opener.decrypt(password(PASSWORD)).await.err();
+    let request = 4 + db.as_os_str().len() + 4 + keyfile.as_os_str().len();
+    assert_eq!(outcome, Some(VaultError::Io(request.to_string())));
 }

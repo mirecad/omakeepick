@@ -102,12 +102,14 @@ A `state` event is sent right after a client connects and after every state chan
 
 A lock always wins over an unlock that is still running. If `lock`, `close` or an automatic
 lock (idle, screen lock, suspend) arrives while an `unlock` or `quickUnlock` is in progress, the
-key derivation (which runs in a helper process) is killed and the request fails with
-`cancelled` at once; the state stays as the lock left it. A quick unlock cancelled by a lock that keeps the PIN (manual,
+daemon drops the credentials, kills the helper process that reads the files and derives the
+key, and the request fails with `cancelled` at once, whether the helper was deriving or stuck
+reading a file; the state stays as the lock left it. A quick unlock cancelled by a lock that keeps the PIN (manual,
 idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether the PIN was right
 (`cancelled`) or wrong (`no_quick_unlock`). The same holds for `act`: auto-type stops before
 the next token once a lock happened, and a copy that lands on the clipboard after a lock is
 cleared again; both fail with `cancelled`. A reload that was reading the file is killed too.
+An unlock whose database or key file cannot be read within 30 s fails with `failed`.
 Before suspend the daemon waits for such requests to end before letting the system sleep, for as
 long as logind's `InhibitDelayMaxSec` allows; on exit, for up to 2 s.
 
