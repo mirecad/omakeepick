@@ -110,6 +110,9 @@ idle, screen) keeps it; one cancelled by suspend or `close` loses it, whether th
 the next token once a lock happened, and a copy that lands on the clipboard after a lock is
 cleared again; both fail with `cancelled`. A reload that was reading the file is killed too.
 An unlock whose database or key file cannot be read within 30 s fails with `failed`.
+From the moment logind announces a sleep until it reports the wake-up, `unlock` and
+`quickUnlock` are refused with `cancelled`: such a request starts after the sleep's lock, which
+therefore could not stop it.
 Before suspend the daemon waits for such requests to end before letting the system sleep, for as
 long as logind's `InhibitDelayMaxSec` allows; on exit, for up to 2 s.
 

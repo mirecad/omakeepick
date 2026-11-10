@@ -76,9 +76,11 @@ async fn inhibit(manager: &ManagerProxy<'_>) -> Option<OwnedFd> {
 }
 
 pub async fn logind_loop(daemon: Arc<Daemon>) {
-    if let Err(e) = watch_logind(daemon).await {
+    if let Err(e) = watch_logind(daemon.clone()).await {
         eprintln!("omakeepickd: logind unavailable, not locking on suspend: {e}");
     }
+    // Without logind nobody would report the wake-up.
+    daemon.woke();
 }
 
 async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
@@ -111,18 +113,27 @@ async fn watch_logind(daemon: Arc<Daemon>) -> zbus::Result<()> {
     });
 
     let mut inhibitor = inhibit(&manager).await;
+    // Asked ahead of time: when a sleep is announced, the lock must not wait for logind.
+    let mut limit = settle_limit(&manager).await;
     while let Some(signal) = sleeps.next().await {
         let Ok(args) = signal.args() else { continue };
         if args.start {
+            // Nothing is unlocked from here until the wake-up: an unlock that starts after
+            // the lock below would not be cancelled by it.
+            daemon.going_to_sleep();
             // The database is wiped at once and a running unlock stopped: it drops its
             // credentials and its helper is killed. Then wait for the helper to be gone, for
             // the clipboard clear and for any copy or auto-type still holding secrets, so they
             // finish (and are discarded) before the inhibitor is released.
-            daemon.lock_and_settle(LockReason::Sleep, settle_limit(&manager).await).await;
+            daemon.lock_and_settle(LockReason::Sleep, limit).await;
             // Releasing the inhibitor lets the system go to sleep.
             inhibitor = None;
-        } else if inhibitor.is_none() {
-            inhibitor = inhibit(&manager).await;
+        } else {
+            daemon.woke();
+            if inhibitor.is_none() {
+                inhibitor = inhibit(&manager).await;
+            }
+            limit = settle_limit(&manager).await;
         }
     }
     drop(inhibitor);

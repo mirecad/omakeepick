@@ -120,7 +120,8 @@ Search also understands fzf syntax: `'exact`, `^prefix`, `suffix$`, `!exclude`.
 - A lock always wins. If the screen locks or the machine suspends while an unlock is still
   running, that unlock is stopped and the database stays locked. Auto-type in progress stops,
   and a value copied at that moment is cleared. Before suspend, the daemon holds the system
-  back for a few seconds at most until this is done.
+  back for a few seconds at most until this is done, and once a suspend has started nothing
+  can be unlocked until the machine is awake again.
 
 ### Settings
 

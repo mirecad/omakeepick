@@ -350,17 +350,33 @@ fn a_lock_during_an_unlock_wins() {
     assert_eq!(conn.state()["entryCount"], 7);
 }
 
-/// The `open-db` helper that `daemon` started, found through /proc.
+/// The `open-db` helper that `daemon` is running, found through /proc. One that has ended and
+/// only waits to be reaped does not count.
 fn helper_of(daemon: &Daemon) -> Option<u32> {
     let parent = daemon.child.id();
     std::fs::read_dir("/proc").unwrap().flatten().find_map(|entry| {
         let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
         let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
         // "pid (comm) state ppid ..."; comm may contain spaces, so split after its ')'.
-        let after_comm = &stat[stat.rfind(')')? + 2..];
-        let ppid: u32 = after_comm.split(' ').nth(1)?.parse().ok()?;
-        (ppid == parent).then_some(pid)
+        let mut after_comm = stat[stat.rfind(')')? + 2..].split(' ');
+        let state = after_comm.next()?;
+        let ppid: u32 = after_comm.next()?.parse().ok()?;
+        (ppid == parent && state != "Z").then_some(pid)
     })
+}
+
+/// Waits until something has reached the hold hook on `fifo` (it is blocked opening it for
+/// reading), and keeps it there: the returned writer never writes. Dropping it lets go of the
+/// hold.
+fn held_at(fifo: &Path) -> std::fs::File {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut writer = None;
+    wait_until("the hold is reached", || {
+        // Without a reader, a non-blocking open for writing fails (ENXIO).
+        writer = std::fs::OpenOptions::new().write(true).custom_flags(libc::O_NONBLOCK).open(fifo).ok();
+        writer.is_some()
+    });
+    writer.unwrap()
 }
 
 fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
@@ -389,7 +405,8 @@ fn a_lock_kills_a_running_derivation() {
     }
     let env = Env::new();
     // With OMAKEEPICK_TEST_HOLD_KDF (debug builds), the helper blocks on this FIFO where its
-    // derivation would run. Nothing ever writes to it: a killed helper is the only way out.
+    // derivation would run. Nothing ever writes to it, and the test keeps it from seeing an
+    // end of file: a killed helper is the only way out.
     let fifo = env.dir.path().join("hold-kdf");
     assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
     let serve = |env: &Env| {
@@ -402,12 +419,10 @@ fn a_lock_kills_a_running_derivation() {
         conn.events.clear();
         let id = conn.send("unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));
         conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
-        let mut helper = None;
-        wait_until("the helper has started", || {
-            helper = helper_of(daemon);
-            helper.is_some()
-        });
-        let helper = helper.unwrap();
+        // The hold is where the derivation would run: the helper has read the files and has
+        // been given the credentials.
+        let hold = held_at(&fifo);
+        let helper = helper_of(daemon).expect("a helper at the hold");
         // The credentials went to the helper on stdin: not on its command line, which every
         // process can read, and not in its environment. The helper is non-dumpable like the
         // daemon, so its environment is not readable at all (except by root).
@@ -417,13 +432,13 @@ fn a_lock_kills_a_running_derivation() {
             Ok(environ) => assert!(!environ.windows(PASSWORD.len()).any(|w| w == PASSWORD.as_bytes())),
             Err(e) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}"),
         }
-        (id, helper)
+        (id, helper, hold)
     };
 
     // A screen lock: the request fails at once and the helper is gone.
     let daemon = serve(&env);
     let mut conn = env.connect();
-    let (id, helper) = start_unlock(&mut conn, &daemon);
+    let (id, helper, _hold) = start_unlock(&mut conn, &daemon);
     assert_eq!(conn.request("lock", json!({"reason": "screen"}))["ok"], true);
     let started = Instant::now();
     assert_eq!(conn.reply(id)["error"], "cancelled");
@@ -433,7 +448,7 @@ fn a_lock_kills_a_running_derivation() {
     assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
 
     // `quit` (and so suspend, which locks the same way) does not wait for it either.
-    let (_, helper) = start_unlock(&mut conn, &daemon);
+    let (_, helper, _hold) = start_unlock(&mut conn, &daemon);
     assert_eq!(conn.request("quit", json!({}))["ok"], true);
     let mut daemon = daemon;
     wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
@@ -443,15 +458,18 @@ fn a_lock_kills_a_running_derivation() {
     // The daemon dying takes the helper with it (PR_SET_PDEATHSIG).
     let daemon = serve(&env);
     let mut conn = env.connect();
-    let (_, helper) = start_unlock(&mut conn, &daemon);
+    let (_, helper, _hold) = start_unlock(&mut conn, &daemon);
     unsafe { libc::kill(daemon.child.id() as i32, libc::SIGKILL) };
     wait_until("the helper is dead", || !is_alive(helper));
 }
 
 /// Reading the database or the key file can hang for as long as the file system likes (a
 /// network mount that stopped answering). The helper does the reading, before the daemon gives
-/// it any credential, so a lock neither waits for the read nor leaves the password with
-/// anything that is stuck in it.
+/// it any credential, so a lock does not wait for the read.
+///
+/// The hold here stands in for the hang. Unlike a read on a dead FUSE mount it ends when the
+/// helper is killed, so this cannot show that the daemon does not wait for the helper to die:
+/// `tests/manual/hung-mount.py` does, on a mount that really stops answering.
 #[test]
 fn a_lock_does_not_wait_for_a_file_that_hangs() {
     if !cfg!(debug_assertions) {
@@ -475,16 +493,12 @@ fn a_lock_does_not_wait_for_a_file_that_hangs() {
         let unlock = json!({"db": db, "keyfile": keyfile, "password": PASSWORD, "pin": "2468"});
         let id = conn.send("unlock", unlock);
         conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
-        let mut helper = None;
-        wait_until("the helper has started", || {
-            helper = helper_of(daemon);
-            helper.is_some()
-        });
-        (id, helper.unwrap())
+        let hold = held_at(&fifo);
+        (id, helper_of(daemon).expect("a helper at the hold"), hold)
     };
 
     // Suspend: the unlock ends at once, the helper is killed, and the daemon is ready again.
-    let (id, helper) = start_unlock(&mut conn, &daemon);
+    let (id, helper, _hold) = start_unlock(&mut conn, &daemon);
     let started = Instant::now();
     assert_eq!(conn.request("lock", json!({"reason": "sleep"}))["ok"], true);
     assert_eq!(conn.reply(id)["error"], "cancelled");
@@ -494,16 +508,108 @@ fn a_lock_does_not_wait_for_a_file_that_hangs() {
     assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
 
     // `quit` (which settles the same way suspend does) is not held up by it either.
-    let (_, helper) = start_unlock(&mut conn, &daemon);
+    let (_, helper, _hold) = start_unlock(&mut conn, &daemon);
     assert_eq!(conn.request("quit", json!({}))["ok"], true);
     wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
     assert!(!is_alive(helper));
 }
 
-/// The daemon does not read the key file: the helper does, and hands its contents back with
-/// the database. Quick unlock and reloads then work from memory, without the file.
+/// The daemon opens neither the database nor the key file: the helper does, in its first step.
+/// Here that step is held up, and the two files only come into being while it waits. A daemon
+/// that looked at either one itself would have failed the unlock by then.
 #[test]
-fn a_key_file_is_read_by_the_helper_and_only_for_the_unlock() {
+fn the_daemon_leaves_both_files_to_the_helper() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    let fifo = env.dir.path().join("hold-read");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut serve = env.command(&["serve"]);
+    serve.env("OMAKEEPICK_TEST_HOLD_READ", &fifo);
+    let _daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.dir.path().join("Secrets.kdbx");
+    let keyfile = env.dir.path().join("Secrets.keyx");
+
+    let id = conn.send("unlock", json!({"db": db, "keyfile": keyfile, "password": PASSWORD}));
+    conn.wait_event("busy", |m| m["event"] == "state" && m["busy"] == true);
+    let hold = held_at(&fifo);
+    assert!(!db.exists() && !keyfile.exists());
+    std::fs::copy(fixture("password-keyfile.kdbx"), &db).unwrap();
+    std::fs::copy(fixture("password-keyfile.keyx"), &keyfile).unwrap();
+    drop(hold);
+    assert_eq!(conn.reply(id)["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 7);
+}
+
+/// A lock still wins when it arrives after the helper is done: while the daemon takes the
+/// handed-over database apart, and before it is installed.
+#[test]
+fn a_lock_wins_after_the_helper_is_done() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    // With OMAKEEPICK_TEST_HOLD_HANDOVER (debug builds), the daemon blocks on this FIFO once
+    // the helper has handed the database over.
+    let fifo = env.dir.path().join("hold-handover");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut serve = env.command(&["serve"]);
+    serve.env("OMAKEEPICK_TEST_HOLD_HANDOVER", &fifo);
+    let _daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    // Sends an unlock, lets it run up to the hold, sends `then` and lets go of the hold.
+    let interrupted = |conn: &mut Conn, cmd: &str, args: Value, then: Option<(&str, Value)>| {
+        let id = conn.send(cmd, args);
+        let hold = held_at(&fifo);
+        if let Some((cmd, args)) = then {
+            assert_eq!(conn.request(cmd, args)["ok"], true);
+        }
+        drop(hold);
+        conn.reply(id)
+    };
+    let unlock = json!({"db": db, "password": PASSWORD, "pin": "2468"});
+    let pin = json!({"pin": "2468"});
+
+    // A full unlock: nothing is installed, and no PIN key is made.
+    let lock = Some(("lock", json!({"reason": "screen"})));
+    assert_eq!(interrupted(&mut conn, "unlock", unlock.clone(), lock.clone())["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
+    assert_eq!(state["quickUnlock"], false);
+    assert_eq!(conn.request("search", json!({"query": "git"}))["error"], "locked");
+    assert_eq!(
+        interrupted(&mut conn, "unlock", unlock.clone(), Some(("close", json!({}))))["error"],
+        "cancelled"
+    );
+    assert_eq!(conn.state()["phase"], "closed");
+
+    // A quick unlock interrupted by a screen lock gets the PIN key back; by suspend, it does not.
+    assert_eq!(interrupted(&mut conn, "unlock", unlock.clone(), None)["ok"], true);
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    assert_eq!(interrupted(&mut conn, "quickUnlock", pin.clone(), lock)["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("locked"), json!(false)));
+    assert_eq!((state["quickUnlock"].clone(), state["pinAttemptsLeft"].clone()), (json!(true), json!(3)));
+    let sleep = Some(("lock", json!({"reason": "sleep"})));
+    assert_eq!(interrupted(&mut conn, "quickUnlock", pin.clone(), sleep)["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["quickUnlock"].clone()), (json!("locked"), json!(false)));
+    assert_eq!(conn.request("quickUnlock", pin)["error"], "no_quick_unlock");
+
+    // Left alone, the same path unlocks.
+    assert_eq!(interrupted(&mut conn, "unlock", unlock, None)["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 7);
+}
+
+/// The helper hands the key file's contents back with the database, so quick unlock and
+/// reloads work from memory afterwards: the key file is not needed again.
+#[test]
+fn quick_unlock_and_reloads_do_not_need_the_key_file_again() {
     let env = Env::new();
     let _daemon = env.serve();
     let mut conn = env.connect();
@@ -545,6 +651,18 @@ fn a_key_file_is_read_by_the_helper_and_only_for_the_unlock() {
     changed.save(&mut std::fs::File::create(&tmp).unwrap(), key()).unwrap();
     std::fs::rename(&tmp, &db).unwrap();
     conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 8);
+
+    // A database caught half-written, here cut off inside its header, is no reason to forget
+    // the PIN key either. (Cut off further in, a KDBX 3.1 file cannot be told from one that
+    // was given the wrong key, and that still costs the PIN key.)
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+    let whole = std::fs::read(&db).unwrap();
+    std::fs::write(&db, &whole[..40]).unwrap();
+    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["error"], "format_error");
+    assert_eq!(conn.state()["quickUnlock"], true);
+    std::fs::write(&db, &whole).unwrap();
+    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 8);
 }
 
 #[test]
@@ -571,6 +689,44 @@ fn reloads_when_the_file_changes() {
     conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 8);
     let found = conn.request("search", json!({"query": "brand new"}));
     assert_eq!(found["entries"][0]["title"], "Brand new");
+}
+
+/// A database that is replaced while its unlock is still running: the unlock opens the copy its
+/// helper had read, and the new one is loaded right after it instead of going unnoticed.
+#[test]
+fn a_change_during_the_unlock_is_loaded_after_it() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    let fifo = env.dir.path().join("hold-kdf");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let mut serve = env.command(&["serve"]);
+    serve.env("OMAKEEPICK_TEST_HOLD_KDF", &fifo);
+    let _daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+    let db = env.db_copy();
+
+    // The helper has read the file and is where it would derive the key.
+    let id = conn.send("unlock", json!({"db": db, "password": PASSWORD}));
+    let hold = held_at(&fifo);
+    let mut changed =
+        Database::open(&mut std::fs::File::open(&db).unwrap(), DatabaseKey::new().with_password(PASSWORD))
+            .unwrap();
+    changed.config.version = keepass::config::DatabaseVersion::KDB4(1);
+    changed.root_mut().add_entry().set_unprotected("Title", "Brand new");
+    let tmp = db.with_extension("tmp");
+    changed
+        .save(&mut std::fs::File::create(&tmp).unwrap(), DatabaseKey::new().with_password(PASSWORD))
+        .unwrap();
+    std::fs::rename(&tmp, &db).unwrap();
+    drop(hold);
+    assert_eq!(conn.reply(id)["ok"], true);
+
+    // The reload that follows the unlock reaches the same hold with the new file.
+    drop(held_at(&fifo));
+    conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 8);
 }
 
 #[test]
@@ -615,6 +771,238 @@ fn ctl_usage_errors() {
     assert_eq!(env.command(&["bogus"]).output().unwrap().status.code(), Some(2));
 }
 
+/// Starts a private message bus with its socket at `dir`/`name`. `None` if `dbus-daemon` is not
+/// installed.
+fn start_bus(dir: &Path, name: &str) -> Option<(Child, String)> {
+    let config = dir.join(format!("{name}.conf"));
+    std::fs::write(
+        &config,
+        format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig>
+  <type>session</type>
+  <listen>unix:path={}</listen>
+  <policy context="default">
+    <allow send_destination="*"/>
+    <allow receive_sender="*"/>
+    <allow own="*"/>
+  </policy>
+</busconfig>"#,
+            dir.join(name).display()
+        ),
+    )
+    .unwrap();
+    let mut bus = Command::new("dbus-daemon")
+        .arg(format!("--config-file={}", config.display()))
+        .args(["--nofork", "--print-address"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut address = String::new();
+    BufReader::new(bus.stdout.take().unwrap()).read_line(&mut address).unwrap();
+    let address = address.trim().to_string();
+    assert!(!address.is_empty(), "dbus-daemon did not start");
+    Some((bus, address))
+}
+
+/// A private bus whose one service stands in for systemd-logind as the daemon uses it: it hands
+/// out sleep inhibitors and announces a sleep and the wake-up. An inhibitor is the writing end
+/// of a pipe, so the test sees the moment the daemon lets go of it, which is what allows the
+/// real logind to put the machine to sleep.
+struct FakeLogind {
+    bus: Child,
+    address: String,
+    announce: tokio::sync::mpsc::UnboundedSender<bool>,
+    inhibitors: mpsc::Receiver<std::io::PipeReader>,
+}
+
+/// The reading end of the pipe whose writing end the daemon holds as its inhibitor.
+struct Inhibitor(std::io::PipeReader);
+
+impl Inhibitor {
+    /// Whether the daemon has closed its end.
+    fn released(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut poll = libc::pollfd { fd: self.0.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        unsafe { libc::poll(&mut poll, 1, 0) > 0 && poll.revents & libc::POLLHUP != 0 }
+    }
+}
+
+impl FakeLogind {
+    /// `None` if `dbus-daemon` is not installed.
+    fn start(dir: &Path) -> Option<FakeLogind> {
+        let (bus, address) = start_bus(dir, "system-bus")?;
+        let (ready, started) = mpsc::channel();
+        let (taken, inhibitors) = mpsc::channel();
+        let (announce, announcements) = tokio::sync::mpsc::unbounded_channel();
+        let bus_address = address.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            // Also ends, with an error, when the bus goes away at the end of the test.
+            if let Err(e) = runtime.block_on(serve_logind(&bus_address, ready, taken, announcements)) {
+                eprintln!("fake logind: {e}");
+            }
+        });
+        started.recv_timeout(Duration::from_secs(10)).expect("the fake logind did not start");
+        Some(FakeLogind { bus, address, announce, inhibitors })
+    }
+
+    /// A daemon that takes this bus for the system bus.
+    fn serve(&self, env: &Env, configure: impl FnOnce(&mut Command)) -> Daemon {
+        let mut serve = env.command(&["serve"]);
+        serve.env_remove("OMAKEEPICK_NO_LOGIND").env("DBUS_SYSTEM_BUS_ADDRESS", &self.address);
+        configure(&mut serve);
+        env.serve_with(serve)
+    }
+
+    /// The inhibitor the daemon takes next: one at startup, and one after each wake-up.
+    fn next_inhibitor(&self) -> Inhibitor {
+        Inhibitor(self.inhibitors.recv_timeout(Duration::from_secs(10)).expect("no Inhibit call"))
+    }
+
+    /// Emits `PrepareForSleep`: `true` before a sleep, `false` after it.
+    fn prepare_for_sleep(&self, start: bool) {
+        self.announce.send(start).unwrap();
+    }
+}
+
+impl Drop for FakeLogind {
+    fn drop(&mut self) {
+        let _ = self.bus.kill();
+        let _ = self.bus.wait();
+    }
+}
+
+async fn serve_logind(
+    address: &str,
+    ready: mpsc::Sender<()>,
+    taken: mpsc::Sender<std::io::PipeReader>,
+    mut announcements: tokio::sync::mpsc::UnboundedReceiver<bool>,
+) -> zbus::Result<()> {
+    let conn = zbus::connection::Builder::address(address).build().await?;
+    let mut messages = zbus::MessageStream::from(&conn);
+    conn.request_name("org.freedesktop.login1").await?;
+    ready.send(()).unwrap();
+    // `InhibitDelayMaxSec`: how long the real logind would wait for the inhibitor.
+    let delay_max = || Variant::from(3_000_000u64);
+    loop {
+        tokio::select! {
+            start = announcements.recv() => {
+                let Some(start) = start else { return Ok(()) };
+                conn.emit_signal(
+                    None::<&str>,
+                    "/org/freedesktop/login1",
+                    "org.freedesktop.login1.Manager",
+                    "PrepareForSleep",
+                    &(start,),
+                )
+                .await?;
+            }
+            message = messages.next() => {
+                let Some(message) = message else { return Ok(()) };
+                let message = message?;
+                let header = message.header();
+                if header.message_type() != zbus::message::Type::MethodCall {
+                    continue;
+                }
+                match header.member().map(|m| m.as_str()) {
+                    Some("Inhibit") => {
+                        let (reader, writer) = std::io::pipe()?;
+                        conn.reply(&header, &zbus::Fd::from(std::os::fd::OwnedFd::from(writer))).await?;
+                        taken.send(reader).unwrap();
+                    }
+                    Some("GetAll") => {
+                        conn.reply(&header, &HashMap::from([("InhibitDelayMaxUSec", delay_max())])).await?;
+                    }
+                    Some("Get") => conn.reply(&header, &delay_max()).await?,
+                    // GetSession, for one: the daemon then goes without the session's lock signal.
+                    _ => {
+                        let error = "org.freedesktop.DBus.Error.UnknownMethod";
+                        conn.reply_error(&header, error, &"not in this stand-in").await?;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Suspend from start to finish, against a stand-in for logind. The daemon lets go of its
+/// sleep inhibitor only once it is locked, and from the announcement until the wake-up it
+/// unlocks nothing: an unlock that starts after the sleep's lock is not cancelled by it, and
+/// would leave the machine asleep with an open database.
+#[test]
+fn a_sleep_locks_and_nothing_unlocks_until_the_wake_up() {
+    let env = Env::new();
+    let Some(logind) = FakeLogind::start(env.dir.path()) else {
+        eprintln!("skipped: dbus-daemon is not installed");
+        return;
+    };
+    let _daemon = logind.serve(&env, |_| {});
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    let inhibitor = logind.next_inhibitor();
+    assert_eq!(unlock(&mut conn, &db, Some("2468"))["ok"], true);
+    assert!(!inhibitor.released());
+
+    logind.prepare_for_sleep(true);
+    wait_until("the inhibitor is released", || inhibitor.released());
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["quickUnlock"].clone()), (json!("locked"), json!(false)));
+    assert_eq!(state["lockReason"], "sleep");
+    // The machine can take a while to go down, and the daemon keeps answering until it does.
+    assert_eq!(unlock(&mut conn, &db, Some("2468"))["error"], "cancelled");
+    assert_eq!(conn.request("quickUnlock", json!({"pin": "2468"}))["error"], "cancelled");
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("locked"), json!(false)));
+
+    // Awake again: a new inhibitor is taken, and unlocking works.
+    logind.prepare_for_sleep(false);
+    let inhibitor = logind.next_inhibitor();
+    assert_eq!(unlock(&mut conn, &db, Some("2468"))["ok"], true);
+    assert_eq!(conn.state()["phase"], "unlocked");
+    assert!(!inhibitor.released());
+}
+
+/// The inhibitor is held for as long as something still has secrets in hand. Here that is an
+/// unlock the daemon is taking over from its helper when the sleep is announced: the sleep has
+/// to wait for it, and it is not installed.
+#[test]
+fn a_sleep_waits_for_what_is_still_in_flight() {
+    if !cfg!(debug_assertions) {
+        eprintln!("skipped: needs a debug build of omakeepickd");
+        return;
+    }
+    let env = Env::new();
+    let Some(logind) = FakeLogind::start(env.dir.path()) else {
+        eprintln!("skipped: dbus-daemon is not installed");
+        return;
+    };
+    let fifo = env.dir.path().join("hold-handover");
+    assert!(Command::new("mkfifo").arg(&fifo).status().unwrap().success());
+    let _daemon = logind.serve(&env, |serve| {
+        serve.env("OMAKEEPICK_TEST_HOLD_HANDOVER", &fifo);
+    });
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    let inhibitor = logind.next_inhibitor();
+
+    let id = conn.send("unlock", json!({"db": db, "password": PASSWORD, "pin": "2468"}));
+    let hold = held_at(&fifo);
+    logind.prepare_for_sleep(true);
+    // The stand-in's logind would wait 3 s for the inhibitor; well within that, it is still held.
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!inhibitor.released(), "the inhibitor was let go of with an unlock still in flight");
+    drop(hold);
+    assert_eq!(conn.reply(id)["error"], "cancelled");
+    wait_until("the inhibitor is released", || inhibitor.released());
+    let state = conn.state();
+    assert_eq!((state["phase"].clone(), state["busy"].clone()), (json!("closed"), json!(false)));
+    assert_eq!(state["quickUnlock"], false);
+}
+
 /// A private session bus whose one service stands in for xdg-desktop-portal's FileChooser. Like
 /// the real portal it turns away callers whose `/proc/<pid>/root` it cannot open, which is what
 /// `PR_SET_DUMPABLE=0` does to the daemon. Each `OpenFile` answers with the next of `responses`
@@ -634,37 +1022,7 @@ struct PortalCall {
 impl FakePortal {
     /// `None` if `dbus-daemon` is not installed.
     fn start(dir: &Path, responses: Vec<(u32, &'static str)>) -> Option<FakePortal> {
-        let config = dir.join("bus.conf");
-        std::fs::write(
-            &config,
-            format!(
-                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
- "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig>
-  <type>session</type>
-  <listen>unix:path={}</listen>
-  <policy context="default">
-    <allow send_destination="*"/>
-    <allow receive_sender="*"/>
-    <allow own="*"/>
-  </policy>
-</busconfig>"#,
-                dir.join("bus").display()
-            ),
-        )
-        .unwrap();
-        let mut bus = Command::new("dbus-daemon")
-            .arg(format!("--config-file={}", config.display()))
-            .args(["--nofork", "--print-address"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .ok()?;
-        let mut address = String::new();
-        BufReader::new(bus.stdout.take().unwrap()).read_line(&mut address).unwrap();
-        let address = address.trim().to_string();
-        assert!(!address.is_empty(), "dbus-daemon did not start");
+        let (bus, address) = start_bus(dir, "bus")?;
         let (ready, started) = mpsc::channel();
         let (report, calls) = mpsc::channel();
         let bus_address = address.clone();

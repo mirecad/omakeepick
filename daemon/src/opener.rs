@@ -21,9 +21,12 @@
 //!
 //! A lock, suspend, `quit` or a timeout kills the child at any step and the daemon waits for
 //! it to be reaped, which returns every page it held to the kernel before the sleep inhibitor
-//! is released. A child that the kernel will not kill is one stuck in step 2, and it has not
-//! been given anything. The child dies with the daemon as well (`PR_SET_PDEATHSIG`), and a
-//! parser panic on a hostile file takes down the child, not the daemon.
+//! is released. A child that the kernel will not kill is one stuck in step 2. It has been
+//! given nothing, and holds at most what it has read of the two files, which the kernel's
+//! page cache holds as well. The daemon stops waiting for such a child after a moment. After
+//! step 2 the child has no file open, so neither its work nor its exit can hang. The child
+//! dies with the daemon as well (`PR_SET_PDEATHSIG`), and a parser panic on a hostile file
+//! takes down the child, not the daemon.
 //!
 //! The `keepass` crate can only load a database from KDBX bytes, so the child hands the
 //! decrypted database back as one: re-encrypted under a random one-time key with a one-round
@@ -32,8 +35,11 @@
 //! processes.
 
 use std::ffi::OsString;
+use std::fs::File;
 use std::future::Future;
 use std::io::{Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::FromRawFd;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
@@ -91,6 +97,9 @@ impl WireError {
 
 /// Longest path the child accepts in a request. Linux stops at 4096.
 const MAX_PATH_BYTES: usize = 64 << 10;
+/// Most the child accepts as credentials: a password and a key file, which `vault` caps at
+/// 16 MiB.
+const MAX_CREDENTIAL_BYTES: usize = 32 << 20;
 
 /// `[len32][database path][len32][key file path]`: the first thing the daemon writes to the
 /// child's stdin. An empty key file path means there is none. No secrets.
@@ -210,23 +219,33 @@ pub fn open_db_main() -> ExitCode {
 
 fn serve_request() -> Result<(), VaultError> {
     let io = |what: &'static str| move |e: std::io::Error| VaultError::Io(format!("{what}: {e}"));
-    let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout().lock();
-    let (path, keyfile) = read_request(&mut stdin).map_err(io("Cannot read the request"))?;
+    // The two pipes themselves, unbuffered: std's stdin and stdout keep what passes through
+    // them in buffers of their own, which nothing wipes, and a buffered stdin would read ahead.
+    let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+    let mut stdout = ManuallyDrop::new(unsafe { File::from_raw_fd(1) });
+    let (path, keyfile) = read_request(&mut *stdin).map_err(io("Cannot read the request"))?;
 
     // Everything that touches the file system happens here, and it can take as long as the
-    // file system likes. This process has not been given a credential yet. The key file is
-    // read last, so it is in memory only once nothing is left that could hang.
+    // file system likes. This process has not been given a credential yet. Both files are
+    // opened, read and closed in this step, so that nothing is left for later, exit included,
+    // that could hang. The key file comes last: it is the one whose contents are a secret.
     test_hold("OMAKEEPICK_TEST_HOLD_READ");
     let (data, stamp) = vault::read_database(&path)?;
     vault::check_header(&data)?;
     let keyfile = keyfile.as_deref().map(vault::read_keyfile).transpose()?;
-    stdout.write_all(&stamp.to_bytes()).and_then(|()| stdout.flush()).map_err(io("Cannot answer"))?;
+    stdout.write_all(&stamp.to_bytes()).map_err(io("Cannot answer"))?;
 
-    // The daemon sends the credentials once it has seen the stamp. From here on this process
-    // only computes and uses its pipes, so a SIGKILL ends it at once.
-    let mut credentials = Zeroizing::new(Vec::new());
-    stdin.read_to_end(&mut credentials).map_err(io("Cannot read the credentials"))?;
+    // The daemon sends the credentials once it has seen the stamp: `[len32][key material]`.
+    // From here on this process only computes and uses its pipes, so a SIGKILL ends it at once.
+    let mut len = [0u8; 4];
+    stdin.read_exact(&mut len).map_err(io("Cannot read the credentials"))?;
+    let len = u32::from_le_bytes(len) as usize;
+    if len > MAX_CREDENTIAL_BYTES {
+        return Err(VaultError::Io("Malformed credentials".into()));
+    }
+    // Sized up front, so the buffer never grows and leaves copies behind.
+    let mut credentials = Zeroizing::new(vec![0u8; len]);
+    stdin.read_exact(&mut credentials).map_err(io("Cannot read the credentials"))?;
     let key = KeyMaterial::from_bytes(&credentials)
         .ok_or_else(|| VaultError::Io("Malformed credentials".into()))?;
     drop(credentials);
@@ -245,7 +264,6 @@ fn serve_request() -> Result<(), VaultError> {
     stdout
         .write_all(&(sealed.len() as u64).to_le_bytes())
         .and_then(|()| stdout.write_all(&sealed))
-        .and_then(|()| stdout.flush())
         .map_err(io("Cannot hand over the database"))
 }
 
@@ -346,9 +364,10 @@ impl Opener {
         drop(key);
         self.given = true;
         // If the child is gone already these fail, and `failure` below says why it went.
+        let _ = stdin.write_all(&(credentials.len() as u32).to_le_bytes()).await;
         let _ = stdin.write_all(&credentials).await;
         let _ = stdin.shutdown().await;
-        drop((credentials, stdin)); // EOF: the child has all of it
+        drop((credentials, stdin));
         let sealed = match self.stdout.as_mut() {
             Some(reader) => {
                 let sealed = reader.await;
@@ -386,7 +405,12 @@ impl Opener {
             }
             None => Vec::new(),
         };
-        let reported = serde_json::from_slice::<WireError>(&stderr).ok().and_then(WireError::into_error);
+        // Its report is the last line; anything a library printed before it is not.
+        let reported = stderr
+            .split(|b| *b == b'\n')
+            .rev()
+            .find_map(|line| serde_json::from_slice::<WireError>(line).ok())
+            .and_then(WireError::into_error);
         reported.unwrap_or_else(|| match status {
             // Killed, or a parser panic (which aborts) on a file the header check let through.
             Ok(status) if !status.success() => {

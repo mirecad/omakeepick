@@ -193,6 +193,9 @@ def scenario(binary, mnt, src, ctl, only_the_key_file):
         print("  while the mount answers, unlock:", daemon.reply(1, 30))
         daemon.send(2, "close")
         daemon.reply(2, 3)
+        # The daemon starts watching the database's directory right after an unlock. Let that
+        # finish while the mount still answers: this is about the unlock that comes next.
+        time.sleep(1)
 
         open(flag, "w").close()
         daemon.send(3, "unlock", **unlock)

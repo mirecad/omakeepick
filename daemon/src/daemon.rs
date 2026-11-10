@@ -66,6 +66,10 @@ pub struct Core {
     open_stamp: Option<Stamp>,
     locked: Option<LockedDb>,
     busy: bool,
+    /// Set from logind's announcement of a sleep until it reports the wake-up. Nothing is
+    /// unlocked meanwhile: an unlock that starts after the sleep's lock is not cancelled by it
+    /// and would leave an open database in RAM, and so in a hibernation image.
+    sleeping: bool,
     /// Bumped by every lock. An unlock captures it when it starts and its result is installed
     /// only if it is unchanged, so a lock, close or suspend during an unlock always wins.
     epoch: u64,
@@ -93,9 +97,6 @@ const TOOK_TOO_LONG: &str = "Opening the database took too long and was abandone
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const READ_TOO_LONG: &str = "Reading the database or the key file took too long and was abandoned";
 
-/// How long an unlock waits for the file watcher before it goes on without one.
-const WATCH_TIMEOUT: Duration = Duration::from_secs(2);
-
 /// How long a suspend is held back for a killed helper that was never given credentials. A
 /// helper that `SIGKILL` has not ended by then is stuck in a file read the kernel will not
 /// interrupt, for as long as the file system stays silent.
@@ -104,15 +105,18 @@ const STUCK_HELPER_GRACE: Duration = Duration::from_secs(1);
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_ATOMS: usize = 16;
 
-/// Test hook: with `OMAKEEPICK_TEST_HOLD` set to a FIFO, an unlock blocks there (before the
-/// PIN check, before the helper starts) until the test writes to it, so a lock can be sent
-/// while the unlock is in flight. Debug builds only. `opener` has the matching hooks for the
-/// helper's file reads and for the derivation.
-fn test_hold() {
+/// Test hook: with the environment variable `name` set to a FIFO, an unlock blocks there until
+/// the test writes to it, so a lock can be sent while the unlock is in flight.
+/// `OMAKEEPICK_TEST_HOLD` is before the PIN check and before the helper starts,
+/// `OMAKEEPICK_TEST_HOLD_HANDOVER` after the helper has handed the database over. Debug builds
+/// only. `opener` has the matching hooks for the helper's file reads and for the derivation.
+fn test_hold(name: &str) {
     #[cfg(debug_assertions)]
-    if let Some(fifo) = std::env::var_os("OMAKEEPICK_TEST_HOLD") {
+    if let Some(fifo) = std::env::var_os(name) {
         let _ = std::fs::read(fifo);
     }
+    #[cfg(not(debug_assertions))]
+    let _ = name;
 }
 
 fn unix_now() -> i64 {
@@ -364,6 +368,7 @@ impl Daemon {
                 open_stamp: None,
                 locked: None,
                 busy: false,
+                sleeping: false,
                 epoch: 0,
                 epoch_tx: tokio::sync::watch::channel(0).0,
                 wiped_at: 0,
@@ -424,6 +429,17 @@ impl Daemon {
         self.quit.notified().await
     }
 
+    /// Logind announced a sleep. Called before the lock that goes with it: from here until
+    /// [`woke`](Self::woke), `unlock` and `quickUnlock` are refused.
+    pub fn going_to_sleep(&self) {
+        self.core().sleeping = true;
+    }
+
+    /// The sleep is over, or did not happen after all.
+    pub fn woke(&self) {
+        self.core().sleeping = false;
+    }
+
     /// Locks right away. The clipboard clear runs in the background; `lock_and_settle` waits
     /// for it.
     pub fn lock(self: &Arc<Self>, reason: LockReason) -> Option<tokio::task::JoinHandle<()>> {
@@ -476,36 +492,34 @@ impl Daemon {
     }
 
     /// Starts a helper (see `opener`) and waits until it has read the database and the key
-    /// file and, for an unlock, until the file is being watched. These are the steps that touch
-    /// the file system, and they can hang with it. The helper has no credential yet and the
-    /// caller's are in its own frame, so a lock since `epoch` (or the timeout) makes this
-    /// return at once and the caller drop them, while the helper is killed behind it.
+    /// file. This is the step that touches the file system, and it can hang with it. The
+    /// helper has no credential yet and the caller's are in its own frame, so a lock since
+    /// `epoch` (or the timeout) makes this return at once and the caller drop them, while the
+    /// helper is killed behind it.
     async fn read_files(
         self: &Arc<Self>,
         path: &Path,
         keyfile: Option<&Path>,
-        watch: bool,
         epoch: u64,
-    ) -> Result<(Opener, Stamp, Option<watch::Watcher>), OpenError> {
+    ) -> Result<(Opener, Stamp), OpenError> {
         if !self.still(epoch) {
             return Err(OpenError::Cancelled);
         }
         // /proc/self/exe rather than a path: the binary may have been replaced since we started,
         // and the helper must speak this daemon's protocol.
-        let mut opener = Opener::spawn(Path::new("/proc/self/exe"), path, keyfile).await?;
-        let read = async {
-            let stamp = opener.read().await?;
-            let watcher = if watch { self.watcher(path).await } else { None };
-            Ok::<_, VaultError>((stamp, watcher))
+        let mut opener = tokio::select! {
+            biased;
+            () = self.locked_since(epoch) => return Err(OpenError::Cancelled),
+            opener = Opener::spawn(Path::new("/proc/self/exe"), path, keyfile) => opener?,
         };
         let outcome = tokio::select! {
             biased;
             () = self.locked_since(epoch) => Err(OpenError::Cancelled),
-            result = read => result.map_err(OpenError::Vault),
+            stamp = opener.read() => stamp.map_err(OpenError::Vault),
             () = tokio::time::sleep(READ_TIMEOUT) => Err(OpenError::Vault(VaultError::Io(READ_TOO_LONG.into()))),
         };
         match outcome {
-            Ok((stamp, watcher)) => Ok((opener, stamp, watcher)),
+            Ok(stamp) => Ok((opener, stamp)),
             Err(e) => {
                 self.discard(opener);
                 Err(e)
@@ -538,9 +552,12 @@ impl Daemon {
         // Taking the hand-over apart is a few milliseconds of parsing in memory. It is waited
         // for rather than raced against a lock, so that nothing decrypted is ever left on a
         // thread nobody waits for; the caller checks the epoch before it installs the result.
-        let (db, key) = tokio::task::spawn_blocking(move || handover.unseal())
-            .await
-            .unwrap_or_else(|e| Err(VaultError::Io(format!("Database helper: {e}"))))?;
+        let unsealing = tokio::task::spawn_blocking(move || {
+            test_hold("OMAKEEPICK_TEST_HOLD_HANDOVER");
+            handover.unseal()
+        });
+        let (db, key) =
+            unsealing.await.unwrap_or_else(|e| Err(VaultError::Io(format!("Database helper: {e}"))))?;
         Ok(Opened { db, key, stamp })
     }
 
@@ -551,9 +568,9 @@ impl Daemon {
         keyfile: Option<&Path>,
         key: KeyMaterial,
         epoch: u64,
-    ) -> Result<(Opened, Option<watch::Watcher>), OpenError> {
-        let (opener, stamp, watcher) = self.read_files(path, keyfile, true, epoch).await?;
-        Ok((self.decrypt(opener, stamp, key, epoch).await?, watcher))
+    ) -> Result<Opened, OpenError> {
+        let (opener, stamp) = self.read_files(path, keyfile, epoch).await?;
+        self.decrypt(opener, stamp, key, epoch).await
     }
 
     /// Kills a helper and returns at once, so the caller can drop what it holds without
@@ -580,20 +597,35 @@ impl Daemon {
         });
     }
 
-    /// Starts watching the database file for changes. Adding the watch looks its directory up,
-    /// which can hang like any file access, so it happens on a thread that holds nothing
-    /// secret. Without an answer within `WATCH_TIMEOUT` the database opens unwatched.
-    async fn watcher(&self, path: &Path) -> Option<watch::Watcher> {
-        let (watched, changed) = (path.to_path_buf(), self.reload_tx.clone());
-        let adding = tokio::task::spawn_blocking(move || watch::Watcher::new(&watched, changed));
-        let failed = match tokio::time::timeout(WATCH_TIMEOUT, adding).await {
-            Ok(Ok(Ok(watcher))) => return Some(watcher),
-            Ok(Ok(Err(e))) => e.to_string(),
-            Ok(Err(e)) => e.to_string(),
-            Err(_) => "its directory does not answer".to_string(),
-        };
-        eprintln!("omakeepickd: not watching {}: {failed}", path.display());
-        None
+    /// Starts watching the database that was just installed under `epoch`, in the background.
+    /// Adding the watch looks the file's directory up, which can hang like any file access, so
+    /// it happens on a thread that holds nothing secret, and the unlock does not wait for it.
+    ///
+    /// Once the watch is in, one reload is asked for: the file may have changed between the
+    /// helper reading it and the watch going in, and an event that came while nothing was open
+    /// went nowhere. The reload's helper compares stamps and stops if they are equal.
+    fn watch(self: &Arc<Self>, path: PathBuf, epoch: u64) {
+        let (daemon, changed) = (self.clone(), self.reload_tx.clone());
+        tokio::spawn(async move {
+            let watched = path.clone();
+            let added = tokio::task::spawn_blocking(move || watch::Watcher::new(&watched, changed)).await;
+            let watcher = match added {
+                Ok(Ok(watcher)) => Some(watcher),
+                Ok(Err(e)) => {
+                    eprintln!("omakeepickd: not watching {}: {e}", path.display());
+                    None
+                }
+                Err(_) => None,
+            };
+            let mut core = daemon.core();
+            // Locked, or another database opened, while the directory took its time.
+            if core.epoch != epoch || core.open.as_ref().is_none_or(|open| open.path != path) {
+                return;
+            }
+            core.watcher = watcher;
+            drop(core);
+            let _ = daemon.reload_tx.send(());
+        });
     }
 
     /// Commands answered immediately, in request order.
@@ -707,6 +739,9 @@ impl Daemon {
     /// Marks an unlock as running and returns the epoch its result must be installed under.
     fn begin_busy(&self) -> Result<u64, ApiError> {
         let mut core = self.core();
+        if core.sleeping {
+            return Err(Self::going_to_sleep_error());
+        }
         if core.busy {
             return Err(ApiError::new("busy", "Already unlocking"));
         }
@@ -721,15 +756,13 @@ impl Daemon {
         ApiError::new("cancelled", "Locked before the unlock finished")
     }
 
+    fn going_to_sleep_error() -> ApiError {
+        ApiError::new("cancelled", "The computer is going to sleep")
+    }
+
     /// Installs a freshly opened database. If a lock arrived while it was being opened, the
     /// database is handed back (rejected) instead and the state stays as the lock left it.
-    fn install(
-        self: &Arc<Self>,
-        open: OpenDb,
-        stamp: Stamp,
-        watcher: Option<watch::Watcher>,
-        epoch: u64,
-    ) -> Option<OpenDb> {
+    fn install(self: &Arc<Self>, open: OpenDb, stamp: Stamp, epoch: u64) -> Option<OpenDb> {
         let mut core = self.core();
         if core.epoch != epoch {
             core.busy = false;
@@ -740,12 +773,14 @@ impl Daemon {
         let live: std::collections::HashSet<String> = open.index.iter().map(|e| e.uuid.clone()).collect();
         core.store.prune_usage(&path, |uuid| live.contains(uuid));
         core.open_stamp = Some(stamp);
-        core.watcher = watcher;
+        core.watcher = None;
         core.open = Some(open);
         core.locked = None;
         core.lock_reason = None;
         core.busy = false;
         core.touch();
+        drop(core);
+        self.watch(path, epoch);
         None
     }
 
@@ -765,14 +800,14 @@ impl Daemon {
         let epoch = self.begin_busy()?;
         let _inflight = Inflight::new(self);
         #[cfg(debug_assertions)]
-        let _ = tokio::task::spawn_blocking(test_hold).await;
+        let _ = tokio::task::spawn_blocking(|| test_hold("OMAKEEPICK_TEST_HOLD")).await;
         // The password alone. The key file is read by the helper, before it is given this, and
         // comes back from it joined with the password. Nothing here waits on a file.
         let key = KeyMaterial::from_password(a.password);
         let result = match self.open_database(&path, keyfile.as_deref(), key, epoch).await {
             // Locked in the instant after the helper finished: stop before the PIN work.
             Ok(_) if !self.still(epoch) => Err(OpenError::Cancelled),
-            Ok((Opened { db, key, stamp }, watcher)) => {
+            Ok(Opened { db, key, stamp }) => {
                 let (p, k) = (path.clone(), keyfile);
                 // The PIN's own Argon2id and the index: fixed-cost work in memory.
                 tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
@@ -784,15 +819,15 @@ impl Daemon {
                 })
                 .await
                 .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))))
-                .map(|open| (open, stamp, watcher))
+                .map(|open| (open, stamp))
                 .map_err(OpenError::Vault)
             }
             Err(e) => Err(e),
         };
         match result {
-            Ok((open, stamp, watcher)) => {
+            Ok((open, stamp)) => {
                 let count = open.index.len();
-                let rejected = self.install(open, stamp, watcher, epoch);
+                let rejected = self.install(open, stamp, epoch);
                 self.emit_state();
                 if rejected.is_some() {
                     return Err(Self::cancelled());
@@ -816,6 +851,9 @@ impl Daemon {
     async fn quick_unlock(self: &Arc<Self>, a: PinArgs) -> Reply {
         let (path, keyfile, mut blob, epoch) = {
             let mut core = self.core();
+            if core.sleeping {
+                return Err(Self::going_to_sleep_error());
+            }
             if core.busy {
                 return Err(ApiError::new("busy", "Already unlocking"));
             }
@@ -835,7 +873,7 @@ impl Daemon {
         // The PIN check is a fixed-cost Argon2id of our own; the database's derivation, whose
         // cost the file dictates, runs in the helper.
         let worker = tokio::task::spawn_blocking(move || {
-            test_hold();
+            test_hold("OMAKEEPICK_TEST_HOLD");
             let key = blob.open(&a.pin, p.as_os_str().as_bytes());
             (blob, key)
         });
@@ -855,9 +893,9 @@ impl Daemon {
             None => None,
         };
         match opened {
-            Some(Ok((Opened { db, key, stamp }, watcher))) => {
+            Some(Ok(Opened { db, key, stamp })) => {
                 let open = OpenDb::new(path, keyfile, key, Some(blob), db);
-                if let Some(rejected) = self.install(open, stamp, watcher, epoch) {
+                if let Some(rejected) = self.install(open, stamp, epoch) {
                     // A lock that keeps quick unlock (screen, idle, manual) gets the PIN key
                     // back; sleep and close have wiped it.
                     let OpenDb { quick, .. } = rejected;
@@ -885,9 +923,11 @@ impl Daemon {
             Some(Err(OpenError::Vault(err))) => {
                 let mut core = self.core();
                 core.busy = false;
-                // A file that could not be read (mid-save, unmounted) keeps the PIN key, a file
-                // that no longer opens with the stored key does not.
-                if matches!(err, VaultError::Io(_) | VaultError::NotFound(_)) {
+                // A file that could not be read or is not whole (unmounted, caught mid-save)
+                // keeps the PIN key; a file that no longer opens with the stored key does not.
+                // A wrong key is never a format error: the header is checked before the key
+                // is used, and what the key decrypts is checked against it.
+                if matches!(err, VaultError::Io(_) | VaultError::NotFound(_) | VaultError::Format(_)) {
                     core.restore_quick(blob, epoch);
                 }
                 drop(core);
@@ -1073,8 +1113,8 @@ impl Daemon {
                     () = self.locked_since(epoch) => return,
                 }
             }
-            let (opener, stamp) = match self.read_files(&path, None, false, epoch).await {
-                Ok((opener, stamp, _)) => (opener, stamp),
+            let (opener, stamp) = match self.read_files(&path, None, epoch).await {
+                Ok(read) => read,
                 // Locked meanwhile: the helper was killed, and this copy would be stale anyway.
                 Err(OpenError::Cancelled) => return,
                 // Gone for now (mid-rename, unmounted): the next file event tries again.
