@@ -1155,20 +1155,26 @@ fn a_copied_value_is_taken_back() {
 
     let copied = copy(&mut conn, "copyPassword");
     assert_eq!((copied["copied"].clone(), copied["clearsIn"].clone()), (json!("password"), json!(15)));
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("admin-pw"));
+    wait_until("the password is on the clipboard", || {
+        fake.selection("clipboard").as_deref() == Some("admin-pw")
+    });
     assert_eq!(conn.request("lock", json!({}))["ok"], true);
     wait_until("the clipboard is empty", || fake.selection("clipboard").is_none());
 
     assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
     configure(&mut conn, json!({"clipboardClearSeconds": 1}));
     assert_eq!(copy(&mut conn, "copyUsername")["clearsIn"], 1);
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("admin"));
+    wait_until("the user name is on the clipboard", || {
+        fake.selection("clipboard").as_deref() == Some("admin")
+    });
     wait_until("the clipboard is empty", || fake.selection("clipboard").is_none());
     assert_eq!(conn.state()["phase"], "unlocked");
 
     configure(&mut conn, json!({"clipboardClearSeconds": 0}));
     assert_eq!(copy(&mut conn, "copyUrl")["ok"], true);
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("http://gitea.lan:3000"));
+    wait_until("the URL is on the clipboard", || {
+        fake.selection("clipboard").as_deref() == Some("http://gitea.lan:3000")
+    });
     assert_eq!(conn.request("quit", json!({}))["ok"], true);
     wait_until("the daemon has exited", || daemon.child.try_wait().unwrap().is_some());
     assert_eq!(fake.selection("clipboard"), None);

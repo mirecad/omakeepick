@@ -44,6 +44,16 @@ fn unset(name: &str) {
     unsafe { std::env::remove_var(name) };
 }
 
+/// Waits until `check` holds. What a stand-in records, it records a moment after the daemon's
+/// side of the exchange is done.
+async fn eventually(what: &str, check: impl Fn() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !check() {
+        assert!(Instant::now() < deadline, "timed out waiting until {what}");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 /// Everything a tool was started for is over once the tracker is back at zero: it was waited
 /// for, and its scratch directory removed.
 async fn settled(inflight: &Tracker) {
@@ -102,7 +112,8 @@ async fn tools_end_with_what_started_them() {
     let clipboard = Clipboard::new(inflight.clone());
     let owner = clipboard.offer("s3cret", false).await.unwrap();
     assert_eq!(fake.selection("clipboard").as_deref(), Some("s3cret"));
-    assert_eq!(fake.read("wl-copy.log"), "offer --foreground --type text/plain;charset=utf-8 --sensitive\n");
+    let offered = "offer --foreground --type text/plain;charset=utf-8";
+    eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered} --sensitive\n")).await;
     // wl-copy's buffer file is in a directory of the daemon's own, not in /tmp.
     let buffers = || -> Vec<PathBuf> {
         let Ok(dirs) = fs::read_dir(runtime.join("clip")) else { return vec![] };
@@ -121,7 +132,7 @@ async fn tools_end_with_what_started_them() {
     let old = Clipboard::new(inflight.clone());
     let owner = old.offer("s3cret", true).await.unwrap();
     assert_eq!(fake.selection("primary").as_deref(), Some("s3cret"));
-    assert_eq!(fake.read("wl-copy.log"), "offer --foreground --type text/plain;charset=utf-8 --primary\n");
+    eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered} --primary\n")).await;
     drop(owner);
     settled(&inflight).await;
     unset("FAKE_OLD_WL_COPY");
@@ -166,7 +177,7 @@ async fn tools_end_with_what_started_them() {
     fake.reset();
     set("FAKE_WL_COPY", "taken-over");
     clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
-    assert_eq!(fake.read("kept"), "kept by a manager");
+    eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
     clipboard.forget();
     settled(&inflight).await;
     assert!(fake.read("wl-copy.log").ends_with("clear clipboard\n"), "{}", fake.read("wl-copy.log"));
@@ -174,9 +185,25 @@ async fn tools_end_with_what_started_them() {
     for other in ["kept by a manage", "kept by a manager!", "kept by a managex", ""] {
         fake.reset();
         clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
+        eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
         fs::write(fake.0.join("kept"), other).unwrap();
         clipboard.forget();
         settled(&inflight).await;
         assert!(!fake.read("wl-copy.log").contains("clear"), "cleared {other:?}");
     }
+
+    // A search that gets no answer is given up when a suspend can wait no longer, rather than
+    // when its own patience ends.
+    fake.reset();
+    clipboard.copy(Zeroizing::new("kept by a manager".into())).await.unwrap();
+    eventually("the manager has its copy", || fake.read("kept") == "kept by a manager").await;
+    set("FAKE_WL_PASTE", "stalls");
+    clipboard.forget();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(inflight.count(), 1, "nothing is looking for the manager's copy");
+    let hurried = Instant::now();
+    inflight.hurry();
+    settled(&inflight).await;
+    assert!(hurried.elapsed() < Duration::from_millis(300));
+    unset("FAKE_WL_PASTE");
 }

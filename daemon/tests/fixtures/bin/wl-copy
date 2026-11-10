@@ -23,9 +23,10 @@ case ${FAKE_WL_COPY:-} in
   stalls) exec sleep 600 ;;
   fails) exit 1 ;;
 esac
-cat > "$TMPDIR/buffer" || exit 1
-cp "$TMPDIR/buffer" "$FAKE_DIR/$which"
+# The selection is there from the moment the value is: no step in between for a test to race.
+ln -sf "$TMPDIR/buffer" "$FAKE_DIR/$which"
 echo $$ > "$FAKE_DIR/$which.pid"
+cat > "$TMPDIR/buffer" || exit 1
 printf 'offer %s\n' "$*" >> "$FAKE_DIR/wl-copy.log"
 if [[ ${FAKE_WL_COPY:-} == taken-over ]]; then
   cp "$TMPDIR/buffer" "$FAKE_DIR/kept"

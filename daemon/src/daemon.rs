@@ -491,14 +491,15 @@ impl Daemon {
             return;
         }
         // A `wtype` that is still typing the burst it had is killed now rather than left to
-        // finish.
+        // finish, and the search for a copied value that a clipboard manager took over is
+        // given up.
         self.inflight.hurry();
         if tokio::time::timeout(LAST_MOMENT, self.inflight.settled()).await.is_err() {
-            // None of what can be left here answers to a lock, or to a signal: fixed-cost work
-            // of our own that is still on a thread (the PIN's Argon2id, taking a hand-over
-            // apart), a helper the kernel cannot end because it is stuck in a file read (it
-            // has no credential), or the search for a copied value that a clipboard manager
-            // took over.
+            // Two things can be left here, and neither answers to a lock or to a signal: work
+            // of our own that is still on a thread, of a size this code sets and no file or
+            // sequence can stretch (the PIN's Argon2id, taking a hand-over apart), and a
+            // helper the kernel cannot end because it is stuck in a file read, which has no
+            // credential.
             eprintln!(
                 "omakeepickd: {} task(s) still not finished {:.1}s after locking",
                 self.inflight.count(),

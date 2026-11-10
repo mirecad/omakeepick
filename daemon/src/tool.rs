@@ -204,7 +204,8 @@ impl Feed {
     pub async fn taken(&self, tool: &mut Tool) -> Result<(), Ended> {
         while self.unread() > 0 {
             tokio::select! {
-                _ = tool.wait() => return Err(Ended),
+                // It can have read everything, and then ended, since the look above.
+                _ = tool.wait() => return if self.unread() == 0 { Ok(()) } else { Err(Ended) },
                 () = tokio::time::sleep(POLL) => {}
             }
         }

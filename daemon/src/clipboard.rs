@@ -187,12 +187,20 @@ impl Clipboard {
         // Something else has the selection, which ended our wl-copy. Most of the time that is
         // the next thing the user copied. It can also be a clipboard manager that keeps a copy
         // of what it sees, hint or not. Whether it is can only be read off the clipboard, and
-        // clearing it takes the compositor: both in the background, as far as they answer.
+        // clearing it takes the compositor: both in the background, as far as they answer,
+        // and no longer than a suspend can wait. Giving up drops what was read so far.
         let guard = self.inflight.hold();
+        let hurried = guard.hurried();
         tokio::spawn(async move {
             let Held { hash, len, .. } = held;
-            if read(len).await.is_some_and(|seen| digest(&seen) == hash) {
-                clear().await;
+            let look = async {
+                if read(len).await.is_some_and(|seen| digest(&seen) == hash) {
+                    clear().await;
+                }
+            };
+            tokio::select! {
+                () = look => {}
+                () = hurried => {}
             }
             drop(guard);
         });
