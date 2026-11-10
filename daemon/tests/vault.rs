@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use keepass::config::{DatabaseVersion, InnerCipherConfig, KdfConfig, OuterCipherConfig};
+use keepass::db::{Value, fields};
 use keepass::{Database, DatabaseKey};
 use omakeepickd::autotype::{self, Fields, Token};
 use omakeepickd::opener::Opener;
@@ -218,17 +219,22 @@ async fn the_helper_hands_over_the_same_database() {
     ];
     for (path, pass, keyfile) in cases {
         let whole = key(pass, keyfile);
-        let direct = vault::open_database(&path, &whole).unwrap();
+        let mut direct = vault::open_database(&path, &whole).unwrap();
+        // The hand-over leaves out what the daemon does not use; the fixtures have none of it.
+        vault::strip(&mut direct);
         // An unlock: the helper reads the key file and is given the password alone.
-        let (unlocked, used) = open_in_helper(&path, keyfile.map(fixture).as_deref(), password(pass))
+        let (mut unlocked, used) = open_in_helper(&path, keyfile.map(fixture).as_deref(), password(pass))
             .await
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        // An empty history and none at all are the same thing, written two ways.
+        vault::strip(&mut unlocked);
         assert_eq!(used.to_bytes(), whole.to_bytes(), "{}", path.display());
         assert_eq!(contents(&direct), contents(&unlocked), "{}", path.display());
         // A quick unlock or a reload: the key from memory, and no key file to read.
-        let (reopened, used) = open_in_helper(&path, None, whole.clone())
+        let (mut reopened, used) = open_in_helper(&path, None, whole.clone())
             .await
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        vault::strip(&mut reopened);
         assert_eq!(used.to_bytes(), whole.to_bytes(), "{}", path.display());
         assert_eq!(contents(&direct), contents(&reopened), "{}", path.display());
         // And the daemon's view of it, which is what matters.
@@ -251,6 +257,73 @@ async fn the_helper_hands_over_the_same_database() {
                 assert_eq!(totp::current_code(&ea).unwrap().0, totp::current_code(&eb).unwrap().0);
             }
         }
+    }
+}
+
+/// Saves `db` under `PASSWORD` and opens it through a helper.
+async fn through_the_helper(db: &Database) -> Result<Database, VaultError> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("made.kdbx");
+    db.save(&mut std::fs::File::create(&path).unwrap(), DatabaseKey::new().with_password(PASSWORD)).unwrap();
+    open_in_helper(&path, None, password(PASSWORD)).await.map(|(db, _)| db)
+}
+
+/// The daemon is handed what it uses and nothing else: attachments and the earlier versions of
+/// entries, so old passwords, stay in the helper, which ends.
+#[tokio::test]
+async fn the_helper_hands_over_only_what_the_daemon_uses() {
+    let mut db = Database::new();
+    {
+        let mut root = db.root_mut();
+        let mut entry = root.add_entry();
+        entry.set_unprotected(fields::TITLE, "Mail");
+        entry.set_protected(fields::PASSWORD, "the-old-password");
+        entry.add_attachment("recovery-codes.txt", Value::protected(b"attached-recovery-codes".to_vec()));
+        // Changing it under `track_changes` files the version above in the entry's history.
+        entry.track_changes().set_protected(fields::PASSWORD, "the-current-password");
+    }
+    let before = serde_json::to_string(&db).unwrap();
+    for part in ["the-old-password", "the-current-password", "recovery-codes.txt"] {
+        assert!(before.contains(part), "the database was not built with {part}");
+    }
+    assert_eq!(db.num_attachments(), 1);
+
+    let handed_over = through_the_helper(&db).await.unwrap();
+    let after = serde_json::to_string(&handed_over).unwrap();
+    assert!(after.contains("the-current-password"));
+    for part in ["the-old-password", "recovery-codes.txt"] {
+        assert!(!after.contains(part), "{part} was handed over");
+    }
+    assert_eq!(handed_over.num_attachments(), 0);
+    let open = OpenDb::new(PathBuf::new(), None, password(PASSWORD), None, handed_over);
+    assert_eq!(open.index.len(), 1);
+    assert_eq!(open.entry(&open.index[0].uuid).unwrap().get_password(), Some("the-current-password"));
+}
+
+/// What the daemon takes apart itself, on a thread a lock cannot stop, has a size that the
+/// helper decides, not the file: attachments do not count, since they are not handed over, and
+/// a database with more text than the limit is refused in the helper.
+#[tokio::test]
+async fn the_hand_over_has_a_size_the_file_does_not_decide() {
+    let megabytes = |db: &mut Database, megabytes: usize, attached: usize| {
+        let mut root = db.root_mut();
+        for i in 0..megabytes {
+            let mut entry = root.add_entry();
+            entry.set_unprotected(fields::TITLE, format!("Entry {i}"));
+            entry.set_unprotected(fields::NOTES, "n".repeat(1 << 20));
+            entry.add_attachment("blob", Value::unprotected(vec![7u8; attached]));
+        }
+    };
+    // 40 MiB of attachments on 2 MiB of text: fine.
+    let mut db = Database::new();
+    megabytes(&mut db, 2, 20 << 20);
+    assert_eq!(through_the_helper(&db).await.unwrap().num_entries(), 2);
+    // 40 MiB of text, which compresses to nothing in the file: refused.
+    let mut db = Database::new();
+    megabytes(&mut db, 40, 0);
+    match through_the_helper(&db).await {
+        Err(VaultError::Format(message)) => assert!(message.contains("too large"), "{message}"),
+        other => panic!("{:?}", other.map(|db| db.num_entries())),
     }
 }
 

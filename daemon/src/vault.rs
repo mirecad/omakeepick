@@ -240,6 +240,17 @@ pub fn check_header(data: &[u8]) -> Result<(), VaultError> {
     header::check(data)
 }
 
+/// Takes out of `db` what the daemon never looks at: attachments, the earlier versions of
+/// entries (old passwords among them), custom icons and the list of deleted objects. The helper
+/// does this before it hands a database over, so none of it ever reaches the daemon.
+pub fn strip(db: &mut Database) {
+    // The histories first: an earlier version can have attachments of its own.
+    db.foreach_entry_mut(|mut entry| entry.history = None);
+    db.foreach_attachment_mut(|attachment| attachment.remove());
+    db.foreach_custom_icon_mut(|icon| icon.remove());
+    db.deleted_objects.clear();
+}
+
 /// Runs the KDF, so call it from a blocking thread.
 pub fn parse_database(data: &[u8], key: &KeyMaterial) -> Result<Database, VaultError> {
     header::check(data)?;

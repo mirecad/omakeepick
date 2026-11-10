@@ -573,9 +573,11 @@ impl Daemon {
                 return Err(e);
             }
         };
-        // Taking the hand-over apart is a few milliseconds of parsing in memory. It is waited
-        // for rather than raced against a lock, so that nothing decrypted is ever left on a
-        // thread nobody waits for; the caller checks the epoch before it installs the result.
+        // Taking the hand-over apart is parsing in memory, of a size the helper keeps bounded
+        // whatever the file says (see `opener`): milliseconds as a rule, about a third of a
+        // second at the limit. It is waited for rather than raced against a lock, so that nothing
+        // decrypted is ever left on a thread nobody waits for; the caller checks the epoch
+        // before it installs the result.
         let unsealing = tokio::task::spawn_blocking(move || {
             test_hold("OMAKEEPICK_TEST_HOLD_HANDOVER");
             handover.unseal()

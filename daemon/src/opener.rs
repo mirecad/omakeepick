@@ -30,9 +30,15 @@
 //!
 //! The `keepass` crate can only load a database from KDBX bytes, so the child hands the
 //! decrypted database back as one: re-encrypted under a random one-time key with a one-round
-//! KDF, which the daemon opens in milliseconds. That key and the credentials travel on the
-//! same pipe, ahead of the data; a pipe is kernel memory shared by nothing but these two
-//! processes.
+//! KDF. That key and the credentials travel on the same pipe, ahead of the data; a pipe is
+//! kernel memory shared by nothing but these two processes.
+//!
+//! Taking that hand-over apart is the one piece of work on the database that the daemon does
+//! itself, on a thread that a lock cannot stop. So its size is not left to the file either.
+//! The child first takes out what the daemon never uses (attachments, the earlier versions of
+//! entries, icons), writes the rest uncompressed, and refuses to hand over more than
+//! [`MAX_HANDOVER_DATABASE_BYTES`]. An ordinary database is a few hundred kilobytes by then
+//! and is taken apart in milliseconds; one at the limit takes about a third of a second.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -101,6 +107,18 @@ const MAX_PATH_BYTES: usize = 64 << 10;
 /// 16 MiB.
 const MAX_CREDENTIAL_BYTES: usize = 32 << 20;
 
+/// Most the child hands over as the database, and so the most the daemon ever has to take
+/// apart on a thread of its own: about ten milliseconds of parsing per mebibyte. An entry is
+/// a little over a kilobyte there, so without attachments and histories this is some twenty
+/// thousand entries.
+pub const MAX_HANDOVER_DATABASE_BYTES: usize = 32 << 20;
+
+/// The whole hand-over: `[len32][key material][one-time key][database]`.
+const MAX_HANDOVER_BYTES: usize = 4 + MAX_CREDENTIAL_BYTES + SECRET_LEN + MAX_HANDOVER_DATABASE_BYTES;
+
+const TOO_LARGE: &str =
+    "The database is too large: more than 32 MiB even without its attachments and entry histories";
+
 /// `[len32][database path][len32][key file path]`: the first thing the daemon writes to the
 /// child's stdin. An empty key file path means there is none. No secrets.
 fn encode_request(path: &Path, keyfile: Option<&Path>) -> Vec<u8> {
@@ -141,9 +159,12 @@ fn hex(bytes: &[u8]) -> Zeroizing<String> {
     out
 }
 
-/// Re-encrypts `db` as KDBX 4 under a fresh random key with a one-round KDF. Returns
-/// `[len32][key material][one-time key][file bytes]`: what [`Handover::unseal`] takes apart.
+/// Re-encrypts `db` as KDBX 4 under a fresh random key with a one-round KDF, without what the
+/// daemon does not use and without compression, so that its size is the work it will be to
+/// read. Returns `[len32][key material][one-time key][file bytes]`: what [`Handover::unseal`]
+/// takes apart.
 fn seal(mut db: Database, key: &KeyMaterial) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    vault::strip(&mut db);
     let mut secret = Zeroizing::new([0u8; SECRET_LEN]);
     getrandom::fill(secret.as_mut()).map_err(|e| VaultError::Io(format!("No randomness: {e}")))?;
     db.config.version = DatabaseVersion::KDB4(1);
@@ -156,8 +177,12 @@ fn seal(mut db: Database, key: &KeyMaterial) -> Result<Zeroizing<Vec<u8>>, Vault
     out.extend_from_slice(&(key.len() as u32).to_le_bytes());
     out.extend_from_slice(&key);
     out.extend_from_slice(secret.as_ref());
+    let database_at = out.len();
     db.save(&mut *out, DatabaseKey::new().with_password(&hex(secret.as_ref())))
         .map_err(|e| VaultError::Io(format!("Cannot hand over the database: {e}")))?;
+    if out.len() - database_at > MAX_HANDOVER_DATABASE_BYTES {
+        return Err(VaultError::Format(TOO_LARGE.into()));
+    }
     Ok(out)
 }
 
@@ -168,7 +193,8 @@ const INCOMPLETE: &str = "The database helper stopped before handing over the da
 pub struct Handover(Zeroizing<Vec<u8>>);
 
 impl Handover {
-    /// Opens what [`seal`] produced. A few milliseconds of parsing: run it on a blocking thread.
+    /// Opens what [`seal`] produced. Parsing of a bounded size: milliseconds as a rule, about
+    /// a third of a second at the limit. Run it on a blocking thread.
     pub fn unseal(self) -> Result<(Database, KeyMaterial), VaultError> {
         let incomplete = || VaultError::Io(INCOMPLETE.into());
         let (len, rest) = self.0.split_at_checked(4).ok_or_else(incomplete)?;
@@ -309,6 +335,10 @@ impl Opener {
             // The hand-over says how long it is, so its buffer never has to grow: growing
             // would leave copies of the credentials behind in freed memory.
             let len = usize::try_from(out.read_u64_le().await?).map_err(std::io::Error::other)?;
+            if len > MAX_HANDOVER_BYTES {
+                // Not from our helper, which stops at the limit itself.
+                return Err(std::io::Error::other("the hand-over is longer than a helper makes it"));
+            }
             let mut sealed = Zeroizing::new(Vec::new());
             sealed.try_reserve_exact(len).map_err(std::io::Error::other)?;
             sealed.resize(len, 0);
