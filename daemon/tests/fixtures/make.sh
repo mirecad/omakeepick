@@ -9,3 +9,6 @@ printf '%s\n%s\n' "$pw" "$pw" | keepassxc-cli import -q -p -t 100 fixture.xml pa
 printf '%s\n%s\n' "$pw" "$pw" | keepassxc-cli import -q -p -t 100 --set-key-file password-keyfile.keyx fixture.xml password-keyfile.kdbx
 head -c 64 /dev/urandom > raw.key
 keepassxc-cli import -q -t 100 --set-key-file raw.key fixture.xml keyfile-only.kdbx </dev/null
+# A database with what the daemon has no use for: a custom icon, entry history, attachments.
+rm -f extras.kdbx
+printf '%s\n%s\n' "$pw" "$pw" | keepassxc-cli import -q -p -t 100 extras.xml extras.kdbx

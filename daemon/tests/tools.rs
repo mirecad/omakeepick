@@ -27,11 +27,18 @@ impl Fake {
         }
     }
 
+    /// Whether the `wl-copy` that last took the selection `which` is still running. One that
+    /// has ended and only waits to be reaped is not.
+    fn owned(&self, which: &str) -> bool {
+        let pid = self.read(&format!("{which}.pid"));
+        let stat = fs::read_to_string(format!("/proc/{}/stat", pid.trim())).unwrap_or_default();
+        stat.rfind(')').and_then(|at| stat[at..].chars().nth(2)).is_some_and(|state| state != 'Z')
+    }
+
     /// What is on the selection `which`: something only while the `wl-copy` that offered it
     /// is alive.
     fn selection(&self, which: &str) -> Option<String> {
-        let pid: u32 = self.read(&format!("{which}.pid")).trim().parse().ok()?;
-        Path::new(&format!("/proc/{pid}")).exists().then(|| self.read(which))
+        self.owned(which).then(|| self.read(which))
     }
 }
 
@@ -53,6 +60,12 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting until {what}");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+}
+
+/// Waits until only `left` holders are left: the owners that are meant to be there.
+async fn settled_but_for(inflight: &Tracker, left: usize) {
+    eventually("the tools that were dropped are gone", || inflight.count() <= left).await;
+    assert_eq!(inflight.count(), left);
 }
 
 /// Everything a tool was started for is over once the tracker is back at zero: it was waited
@@ -114,7 +127,7 @@ async fn tools_end_with_what_started_them() {
     let clipboard = Clipboard::new(inflight.clone());
     let offered = "offer --foreground --sensitive --type text/plain;charset=utf-8";
     let owner = clipboard.offer("s3cret", false).await.unwrap();
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("s3cret"));
+    eventually("clipboard has the value", || fake.selection("clipboard").as_deref() == Some("s3cret")).await;
     eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered}\n")).await;
     // wl-copy's buffer file is in a directory of the daemon's own, not in /tmp.
     let buffers = || -> Vec<PathBuf> {
@@ -131,7 +144,7 @@ async fn tools_end_with_what_started_them() {
     // The primary selection.
     fake.reset();
     let owner = clipboard.offer("s3cret", true).await.unwrap();
-    assert_eq!(fake.selection("primary").as_deref(), Some("s3cret"));
+    eventually("primary has the value", || fake.selection("primary").as_deref() == Some("s3cret")).await;
     eventually("wl-copy has logged", || fake.read("wl-copy.log") == format!("{offered} --primary\n")).await;
     drop(owner);
     settled(&inflight).await;
@@ -174,7 +187,7 @@ async fn tools_end_with_what_started_them() {
     fake.reset();
     let copy = |value: &str| clipboard.copy(Zeroizing::new(value.into()));
     copy("first").await.unwrap();
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("first"));
+    eventually("clipboard has the value", || fake.selection("clipboard").as_deref() == Some("first")).await;
     clipboard.forget();
     settled(&inflight).await;
     assert_eq!(fake.selection("clipboard"), None);
@@ -184,16 +197,27 @@ async fn tools_end_with_what_started_them() {
     let first = copy("first").await.unwrap();
     let second = copy("second").await.unwrap();
     clipboard.clear_if_unchanged(first, Duration::from_millis(10)).await;
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("second"));
+    eventually("clipboard has the value", || fake.selection("clipboard").as_deref() == Some("second")).await;
     clipboard.clear_if_unchanged(second, Duration::from_millis(10)).await;
     settled(&inflight).await;
     assert_eq!(fake.selection("clipboard"), None);
+
+    // The same value again: the first one's wl-copy has lost the selection, and nothing goes
+    // looking for its value, which would find the second and clear it.
+    copy("the same").await.unwrap();
+    copy("the same").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    settled_but_for(&inflight, 1).await;
+    assert_eq!(fake.selection("clipboard").as_deref(), Some("the same"));
+    assert!(!fake.read("wl-copy.log").contains("clear"), "{}", fake.read("wl-copy.log"));
+    clipboard.forget();
+    settled(&inflight).await;
 
     // Two at once take their turns, and it is the later one that stays.
     let (a, b) = tokio::join!(copy("one"), copy("two"));
     let (a, b) = (a.unwrap(), b.unwrap());
     let later = if a > b { "one" } else { "two" };
-    assert_eq!(fake.selection("clipboard").as_deref(), Some(later));
+    eventually("clipboard has the value", || fake.selection("clipboard").as_deref() == Some(later)).await;
     clipboard.forget();
     settled(&inflight).await;
 
@@ -212,7 +236,7 @@ async fn tools_end_with_what_started_them() {
         .await;
     clipboard.forget();
     settled(&inflight).await;
-    assert_eq!(fake.selection("clipboard").as_deref(), Some("theirs"));
+    eventually("clipboard has the value", || fake.selection("clipboard").as_deref() == Some("theirs")).await;
     assert!(!fake.read("wl-copy.log").contains("clear"));
     theirs.kill().unwrap();
     theirs.wait().unwrap();
@@ -220,10 +244,15 @@ async fn tools_end_with_what_started_them() {
     // A clipboard manager that takes the selection over and keeps a copy: that copy is found
     // by its hash and cleared.
     let kept = |which: &str| fake.read(&format!("{which}.kept"));
+    // The manager has its copy, and the wl-copy it took the selection from has ended.
+    let taken_over = async |which: &str, value: &str| {
+        eventually("the manager has taken the selection over", || kept(which) == value && !fake.owned(which))
+            .await;
+    };
     fake.reset();
     set("FAKE_WL_COPY", "taken-over");
     copy("kept by a manager").await.unwrap();
-    eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
+    taken_over("clipboard", "kept by a manager").await;
     clipboard.forget();
     settled(&inflight).await;
     assert!(fake.read("wl-copy.log").ends_with("clear clipboard\n"), "{}", fake.read("wl-copy.log"));
@@ -231,7 +260,7 @@ async fn tools_end_with_what_started_them() {
     for other in ["kept by a manage", "kept by a manager!", "kept by a managex", ""] {
         fake.reset();
         copy("kept by a manager").await.unwrap();
-        eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
+        taken_over("clipboard", "kept by a manager").await;
         fs::write(fake.0.join("clipboard.kept"), other).unwrap();
         clipboard.forget();
         settled(&inflight).await;
@@ -242,7 +271,7 @@ async fn tools_end_with_what_started_them() {
     for (primary, which) in [(false, "clipboard"), (true, "primary")] {
         fake.reset();
         let owner = clipboard.offer("a pasted piece", primary).await.unwrap();
-        eventually("the manager has its copy", || kept(which) == "a pasted piece").await;
+        taken_over(which, "a pasted piece").await;
         drop(owner);
         settled(&inflight).await;
         assert!(
@@ -257,7 +286,7 @@ async fn tools_end_with_what_started_them() {
     // when its own patience ends.
     fake.reset();
     copy("kept by a manager").await.unwrap();
-    eventually("the manager has its copy", || kept("clipboard") == "kept by a manager").await;
+    taken_over("clipboard", "kept by a manager").await;
     set("FAKE_WL_PASTE", "stalls");
     clipboard.forget();
     tokio::time::sleep(Duration::from_millis(100)).await;

@@ -577,8 +577,8 @@ impl Daemon {
             }
         };
         // Taking the hand-over apart is parsing in memory, of a size the helper keeps bounded
-        // whatever the file says (see `opener`): milliseconds as a rule, about a third of a
-        // second at the limit. It is waited for rather than raced against a lock, so that nothing
+        // whatever the file says (see `opener`): milliseconds as a rule, about two thirds of
+        // a second at the limit. It is waited for rather than raced against a lock, so that nothing
         // decrypted is ever left on a thread nobody waits for; the caller checks the epoch
         // before it installs the result.
         let unsealing = tokio::task::spawn_blocking(move || {

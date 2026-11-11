@@ -279,6 +279,7 @@ async fn the_helper_hands_over_only_what_the_daemon_uses() {
         entry.set_unprotected(fields::TITLE, "Mail");
         entry.set_protected(fields::PASSWORD, "the-old-password");
         entry.add_attachment("recovery-codes.txt", Value::protected(b"attached-recovery-codes".to_vec()));
+        entry.set_icon_custom_new(vec![1, 2, 3, 4]);
         // Changing it under `track_changes` files the version above in the entry's history.
         entry.track_changes().set_protected(fields::PASSWORD, "the-current-password");
     }
@@ -286,7 +287,12 @@ async fn the_helper_hands_over_only_what_the_daemon_uses() {
     for part in ["the-old-password", "the-current-password", "recovery-codes.txt"] {
         assert!(before.contains(part), "the database was not built with {part}");
     }
-    assert_eq!(db.num_attachments(), 1);
+    assert_eq!((db.num_attachments(), db.num_custom_icons()), (1, 1));
+    // Built in memory, the database knows which versions use the icon and the attachment in
+    // another way than one read from a file does. Taking them out has to cope with both.
+    let mut built = db.clone();
+    vault::strip(&mut built);
+    assert_eq!((built.num_attachments(), built.num_custom_icons()), (0, 0));
 
     let handed_over = through_the_helper(&db).await.unwrap();
     let after = serde_json::to_string(&handed_over).unwrap();
@@ -298,6 +304,44 @@ async fn the_helper_hands_over_only_what_the_daemon_uses() {
     let open = OpenDb::new(PathBuf::new(), None, password(PASSWORD), None, handed_over);
     assert_eq!(open.index.len(), 1);
     assert_eq!(open.entry(&open.index[0].uuid).unwrap().get_password(), Some("the-current-password"));
+}
+
+/// The same for a database as KeePassXC writes it (`tests/fixtures/extras.xml`): a downloaded
+/// icon on an entry, on an earlier version of it and on a group; two earlier versions with
+/// other passwords; an attachment that only an earlier version has, and one that two entries
+/// share. Read from a file, such things refer to each other in ways a database built in
+/// memory does not show.
+#[tokio::test]
+async fn a_keepassxc_database_is_handed_over_without_its_extras() {
+    let path = fixture("extras.kdbx");
+    let extras =
+        ["the-old-password", "the-older-password", "recovery-codes.txt", "old-codes.txt", "shared.txt"];
+    let mut direct = vault::open_database(&path, &key(PASSWORD, None)).unwrap();
+    let before = serde_json::to_string(&direct).unwrap();
+    for part in extras {
+        assert!(before.contains(part), "the fixture has no {part}");
+    }
+    assert_eq!((direct.num_attachments(), direct.num_custom_icons()), (2, 1));
+
+    // What the helper does to it before it is sealed: no trace of them is left to be written.
+    vault::strip(&mut direct);
+    let stripped = serde_json::to_string(&direct).unwrap();
+    for part in extras {
+        assert!(!stripped.contains(part), "{part} is still in the database");
+    }
+    assert_eq!((direct.num_attachments(), direct.num_custom_icons()), (0, 0));
+
+    let (handed_over, _) = open_in_helper(&path, None, password(PASSWORD)).await.unwrap();
+    assert_eq!(contents(&direct), {
+        let mut handed_over = handed_over.clone();
+        vault::strip(&mut handed_over);
+        contents(&handed_over)
+    });
+    let open = OpenDb::new(path, None, password(PASSWORD), None, handed_over);
+    let found: Vec<(&str, &str)> = open.index.iter().map(|e| (e.title.as_str(), e.group.as_str())).collect();
+    assert_eq!(found, [("Plain", ""), ("Webmail", "Mail")]);
+    let webmail = open.entry(&open.index[1].uuid).unwrap();
+    assert_eq!(webmail.get_password(), Some("the-current-password"));
 }
 
 /// What the daemon takes apart itself, on a thread a lock cannot stop, has a size that the

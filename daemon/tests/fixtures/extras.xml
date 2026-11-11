@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<KeePassFile>
+	<Meta>
+		<Generator>OmaKeePick test fixture</Generator>
+		<DatabaseName>Extras</DatabaseName>
+		<CustomIcons>
+			<Icon>
+				<UUID>AAECAwQFBgcICQoLDA0ODw==</UUID>
+				<Data>iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==</Data>
+			</Icon>
+		</CustomIcons>
+		<Binaries>
+			<Binary ID="0" Compressed="False">YXR0YWNoZWQtcmVjb3ZlcnktY29kZXM=</Binary>
+			<Binary ID="1" Compressed="False">YXR0YWNoZWQtb2xkLWNvZGVz</Binary>
+		</Binaries>
+	</Meta>
+	<Root>
+		<Group>
+			<UUID>EBESExQVFhcYGRobHB0eHw==</UUID>
+			<Name>Root</Name>
+			<Group>
+				<UUID>ICEiIyQlJicoKSorLC0uLw==</UUID>
+				<Name>Mail</Name>
+				<CustomIconUUID>AAECAwQFBgcICQoLDA0ODw==</CustomIconUUID>
+				<Entry>
+					<UUID>MDEyMzQ1Njc4OTo7PD0+Pw==</UUID>
+					<CustomIconUUID>AAECAwQFBgcICQoLDA0ODw==</CustomIconUUID>
+					<String><Key>Title</Key><Value>Webmail</Value></String>
+					<String><Key>UserName</Key><Value>me@example.com</Value></String>
+					<String><Key>Password</Key><Value ProtectInMemory="True">the-current-password</Value></String>
+					<String><Key>URL</Key><Value>https://mail.example.com</Value></String>
+					<Binary><Key>recovery-codes.txt</Key><Value Ref="0"/></Binary>
+					<History>
+						<Entry>
+							<UUID>MDEyMzQ1Njc4OTo7PD0+Pw==</UUID>
+							<CustomIconUUID>AAECAwQFBgcICQoLDA0ODw==</CustomIconUUID>
+							<String><Key>Title</Key><Value>Webmail</Value></String>
+							<String><Key>UserName</Key><Value>me@example.com</Value></String>
+							<String><Key>Password</Key><Value ProtectInMemory="True">the-old-password</Value></String>
+							<Binary><Key>old-codes.txt</Key><Value Ref="1"/></Binary>
+						</Entry>
+						<Entry>
+							<UUID>MDEyMzQ1Njc4OTo7PD0+Pw==</UUID>
+							<String><Key>Title</Key><Value>Webmail</Value></String>
+							<String><Key>Password</Key><Value ProtectInMemory="True">the-older-password</Value></String>
+							<Binary><Key>recovery-codes.txt</Key><Value Ref="0"/></Binary>
+						</Entry>
+					</History>
+				</Entry>
+			</Group>
+			<Entry>
+				<UUID>QEFCQ0RFRkdISUpLTE1OTw==</UUID>
+				<String><Key>Title</Key><Value>Plain</Value></String>
+				<String><Key>UserName</Key><Value>plain</Value></String>
+				<String><Key>Password</Key><Value ProtectInMemory="True">plain-password</Value></String>
+				<Binary><Key>shared.txt</Key><Value Ref="0"/></Binary>
+			</Entry>
+		</Group>
+	</Root>
+</KeePassFile>

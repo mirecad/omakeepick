@@ -200,12 +200,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     the image. (A helper that the kernel cannot kill at once is one stuck in a file read,
     which is before it was given the password.) The helper dies with the daemon too, and a
     parser crash on a malformed file takes down the helper, not the daemon.
-  - The helper hands the daemon only what it uses. Attachments and the earlier versions of
-    entries, old passwords among them, never leave the helper. Reading that hand-over is the
-    one piece of work on the database the daemon does itself, on a thread a lock cannot
-    stop, so its size is not left to the file: more than 32 MiB (some twenty thousand
-    entries) is refused, which keeps it to about a third of a second at worst and a few
-    milliseconds for an ordinary database.
+  - The helper does not hand the daemon what it has no use for. Attachments and the earlier
+    versions of entries, old passwords among them, never leave the helper. Reading that
+    hand-over is the one piece of work on the database the daemon does itself, on a thread a
+    lock cannot stop, so its size is not left to the file: more than 32 MiB (some forty
+    thousand entries) is refused, which keeps it to about two thirds of a second at worst
+    and a few milliseconds for an ordinary database.
   - Copying and typing hold as little as they can, and a lock ends them wherever they are.
     - Auto-type takes a field's value from the database when that field's turn comes, and
       drops it once it is typed. The wait before typing, a `{DELAY}` and the key presses in
@@ -261,7 +261,7 @@ Found a vulnerability? Please report it privately, as described in [SECURITY.md]
   arbitrary key files). YubiKey challenge-response is not supported yet.
 - Screen-lock detection asks Omarchy's lock screen every 10 seconds, so a very short lock may
   not lock the database. Suspend and `loginctl lock-session` are detected instantly.
-- One database at a time, with at most 32 MiB of entries (some twenty thousand), not counting
+- One database at a time, with at most 32 MiB of entries (some forty thousand), not counting
   attachments and entry histories.
 
 ## Development

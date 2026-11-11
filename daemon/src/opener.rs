@@ -38,7 +38,7 @@
 //! The child first takes out what the daemon never uses (attachments, the earlier versions of
 //! entries, icons), writes the rest uncompressed, and refuses to hand over more than
 //! [`MAX_HANDOVER_DATABASE_BYTES`]. An ordinary database is a few hundred kilobytes by then
-//! and is taken apart in milliseconds; one at the limit takes about a third of a second.
+//! and is taken apart in milliseconds; one at the limit takes about two thirds of a second.
 
 use std::ffi::OsString;
 use std::fs::File;
@@ -108,9 +108,10 @@ const MAX_PATH_BYTES: usize = 64 << 10;
 const MAX_CREDENTIAL_BYTES: usize = 32 << 20;
 
 /// Most the child hands over as the database, and so the most the daemon ever has to take
-/// apart on a thread of its own: about ten milliseconds of parsing per mebibyte. An entry is
-/// a little over a kilobyte there, so without attachments and histories this is some twenty
-/// thousand entries.
+/// apart on a thread of its own. What that costs goes by the entries more than by the bytes:
+/// about fifteen milliseconds for a thousand of them. Without attachments and histories an
+/// ordinary entry is under a kilobyte here, so this is some forty thousand entries and about
+/// two thirds of a second.
 pub const MAX_HANDOVER_DATABASE_BYTES: usize = 32 << 20;
 
 /// The whole hand-over: `[len32][key material][one-time key][database]`.
@@ -194,7 +195,7 @@ pub struct Handover(Zeroizing<Vec<u8>>);
 
 impl Handover {
     /// Opens what [`seal`] produced. Parsing of a bounded size: milliseconds as a rule, about
-    /// a third of a second at the limit. Run it on a blocking thread.
+    /// two thirds of a second at the limit. Run it on a blocking thread.
     pub fn unseal(self) -> Result<(Database, KeyMaterial), VaultError> {
         let incomplete = || VaultError::Io(INCOMPLETE.into());
         let (len, rest) = self.0.split_at_checked(4).ok_or_else(incomplete)?;

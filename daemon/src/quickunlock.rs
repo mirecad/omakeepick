@@ -27,11 +27,18 @@ pub struct QuickBlob {
 
 /// The blob is the credentials under a key that a four-digit PIN gives away to anyone who can
 /// try them all, so it is wiped like the credentials themselves, not just freed.
-impl Drop for QuickBlob {
-    fn drop(&mut self) {
+impl Zeroize for QuickBlob {
+    fn zeroize(&mut self) {
         self.ciphertext.zeroize();
         self.salt.zeroize();
         self.nonce.zeroize();
+        self.attempts_left = 0;
+    }
+}
+
+impl Drop for QuickBlob {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -106,6 +113,18 @@ mod tests {
     /// A blob that is dropped (a sleep, three wrong PINs, closing) is wiped, not just freed.
     #[test]
     fn a_dropped_blob_is_wiped() {
+        // What wiping does, on one that can still be looked at: the ciphertext above all.
+        let mut blob = QuickBlob::seal("2468", &key(), b"/db").unwrap();
+        let sealed = blob.ciphertext.len();
+        assert!(sealed > 16 && blob.ciphertext.iter().any(|&b| b != 0));
+        blob.zeroize();
+        assert!(blob.ciphertext.is_empty() && blob.ciphertext.capacity() >= sealed);
+        // SAFETY: `Vec::zeroize` has written zeroes over all of the capacity.
+        let room = blob.ciphertext.spare_capacity_mut();
+        assert!(room.iter().all(|b| unsafe { b.as_ptr().read() } == 0));
+        assert_eq!((blob.salt, blob.nonce, blob.attempts_left), ([0; 16], [0; 12], 0));
+
+        // And dropping one does that.
         let mut blob = std::mem::ManuallyDrop::new(QuickBlob::seal("2468", &key(), b"/db").unwrap());
         assert_ne!((blob.salt, blob.nonce), ([0; 16], [0; 12]));
         // SAFETY: dropped once, here; only the plain arrays it leaves behind are looked at.

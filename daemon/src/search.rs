@@ -39,6 +39,15 @@ pub fn frecency(usage: Option<&(u32, i64)>, now: i64) -> u32 {
     (f64::from(count).ln_1p() * 120.0 * 0.5f64.powf(age_days / 30.0)) as u32
 }
 
+/// `text` in lower case, in a buffer that is wiped and that never moves while it is filled,
+/// which would leave the beginning of the text behind in freed memory: a character's lower
+/// case is never more than twice as long as the character.
+fn lower_case(text: &str) -> Zeroizing<String> {
+    let mut lower = Zeroizing::new(String::with_capacity(text.len() * 2));
+    lower.extend(text.chars().flat_map(char::to_lowercase));
+    lower
+}
+
 /// A `Searcher` holds no entry text between searches. `buf` is where nucleo wants a text that
 /// is not plain ASCII spelled out, a note as much as a title: it is wiped after every search.
 /// The matcher has scratch memory of its own, which cannot be reached from here; it sees the
@@ -73,7 +82,7 @@ impl Searcher {
         let haystack = if haystack.is_ascii() {
             haystack
         } else {
-            folded = Zeroizing::new(haystack.to_lowercase());
+            folded = lower_case(haystack);
             folded.as_str()
         };
         atom.score(Utf32Str::new(haystack, &mut self.buf), &mut self.matcher).map(u32::from)
@@ -222,6 +231,20 @@ mod tests {
         // SAFETY: `Vec::zeroize` has written zeroes over all of the capacity.
         let room = searcher.buf.spare_capacity_mut();
         assert!(room.iter().all(|c| unsafe { c.as_ptr().cast::<u32>().read() } == 0));
+    }
+
+    /// The room `lower_case` takes is enough for any text, so its buffer never moves.
+    #[test]
+    fn lower_case_fits_in_twice_the_room() {
+        for c in (0..=char::MAX as u32).filter_map(char::from_u32) {
+            let lower: usize = c.to_lowercase().map(char::len_utf8).sum();
+            assert!(lower <= 2 * c.len_utf8(), "{c:?}");
+        }
+        // The ones that grow: two bytes become three.
+        let text = "İstanbul ȺȾ Žilina";
+        let lower = lower_case(text);
+        assert_eq!(lower.as_str(), "i\u{307}stanbul ⱥⱦ žilina");
+        assert_eq!(lower.capacity(), text.len() * 2);
     }
 
     #[test]

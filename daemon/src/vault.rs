@@ -240,14 +240,29 @@ pub fn check_header(data: &[u8]) -> Result<(), VaultError> {
     header::check(data)
 }
 
-/// Takes out of `db` what the daemon never looks at: attachments, the earlier versions of
-/// entries (old passwords among them), custom icons and the list of deleted objects. The helper
-/// does this before it hands a database over, so none of it ever reaches the daemon.
+/// Takes out of `db` what the daemon has no use for: attachments (the files and their names),
+/// the earlier versions of entries (old passwords among them), custom icons and the list of
+/// deleted objects. The helper does this before it hands a database over, so none of it ever
+/// reaches the daemon.
 pub fn strip(db: &mut Database) {
-    // The histories first: an earlier version can have attachments of its own.
-    db.foreach_entry_mut(|mut entry| entry.history = None);
-    db.foreach_attachment_mut(|attachment| attachment.remove());
+    // The order matters. The database keeps track of which version of which entry uses an
+    // icon, and taking an icon out follows those tracks into the histories: so the icons go
+    // while the histories are still there.
     db.foreach_custom_icon_mut(|icon| icon.remove());
+    let named: Vec<(EntryId, Vec<String>)> = db
+        .iter_all_entries()
+        .map(|entry| (entry.id(), entry.attachments_named().map(|(name, _)| name.to_string()).collect()))
+        .collect();
+    for (id, names) in named {
+        let Some(mut entry) = db.entry_mut(id) else { continue };
+        for name in names {
+            entry.remove_attachment_by_name(&name);
+        }
+    }
+    db.foreach_entry_mut(|mut entry| entry.history = None);
+    // Whatever only an earlier version had attached. This goes by what the entries say now,
+    // not by the tracks, which the line above has left pointing at versions that are gone.
+    db.remove_unused_attachments();
     db.deleted_objects.clear();
 }
 

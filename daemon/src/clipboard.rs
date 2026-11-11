@@ -43,7 +43,8 @@ const TAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// within this.
 const SET_GRACE: Duration = Duration::from_millis(20);
 
-/// For each tool run while looking for a copy that a clipboard manager kept.
+/// For a tool that is only asked something: `wl-copy` its version, and `wl-paste` and
+/// `wl-copy --clear` while looking for a copy that a clipboard manager kept.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 
 const TOO_OLD: &str = "tool_missing:wl-clipboard 2.3 or newer is needed";
@@ -95,6 +96,15 @@ pub struct Owner {
     inflight: Tracker,
 }
 
+impl Owner {
+    /// For an owner whose selection another one of ours has just taken. There is nothing of
+    /// its value to look for: what is on the clipboard now is the new owner's, and if the two
+    /// values are the same, looking would find the new one and clear it.
+    fn superseded(mut self) {
+        self.mark = None;
+    }
+}
+
 impl Drop for Owner {
     fn drop(&mut self) {
         if self.tool.is_running() {
@@ -128,9 +138,9 @@ impl Drop for Owner {
 /// The value copied last, for as long as it is ours to take back.
 struct Held {
     ticket: u64,
-    /// Held for what dropping it does. One that has ended by itself (something else was
-    /// copied) stays here, unreaped, until the clear timer, a lock or the next copy drops it.
-    _owner: Owner,
+    /// One that has ended by itself (something else was copied) stays here, unreaped, until
+    /// the clear timer, a lock or the next copy drops it.
+    owner: Owner,
 }
 
 pub struct Clipboard {
@@ -165,16 +175,18 @@ impl Clipboard {
     async fn check_version(&self) -> Result<(), String> {
         let probe = || async {
             // An option wl-copy does not know makes it fail before it looks at `--version`.
-            let status = Command::new("wl-copy")
+            let asked = Command::new("wl-copy")
                 .args(["--sensitive", "--version"])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true)
-                .status()
-                .await
-                .map_err(cannot_run)?;
-            if status.success() { Ok(()) } else { Err(TOO_OLD.to_string()) }
+                .status();
+            // Whoever asks has a value in hand, and others wait their turn behind it.
+            let Ok(status) = tokio::time::timeout(LOOKUP_TIMEOUT, asked).await else {
+                return Err("wl-copy does not answer".to_string());
+            };
+            if status.map_err(cannot_run)?.success() { Ok(()) } else { Err(TOO_OLD.to_string()) }
         };
         self.supported.get_or_try_init(probe).await.map(|_| ())
     }
@@ -226,9 +238,11 @@ impl Clipboard {
         let _turn = self.turn.lock().await;
         let owner = self.offer(value, false).await?;
         let ticket = self.next.fetch_add(1, Ordering::Relaxed);
-        let previous = self.current.lock().expect("clipboard lock").replace(Held { ticket, _owner: owner });
+        let previous = self.current.lock().expect("clipboard lock").replace(Held { ticket, owner });
         // Its wl-copy lost the selection to the new one and has ended, or is about to.
-        drop(previous);
+        if let Some(previous) = previous {
+            previous.owner.superseded();
+        }
         Ok(ticket)
     }
 
