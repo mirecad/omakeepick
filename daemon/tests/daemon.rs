@@ -761,6 +761,194 @@ fn a_database_that_unpacks_to_gigabytes_is_not_opened() {
     assert_eq!((found["total"].clone(), found["entries"][0]["title"].clone()), (json!(3), json!("GitHub")));
 }
 
+/// Saves `db` under `PASSWORD` with a key derivation that costs nothing.
+fn save(mut db: Database, path: &Path) {
+    db.config.version = keepass::config::DatabaseVersion::KDB4(1);
+    db.config.kdf_config = keepass::config::KdfConfig::Aes { rounds: 1 };
+    db.save(&mut std::fs::File::create(path).unwrap(), DatabaseKey::new().with_password(PASSWORD)).unwrap();
+}
+
+/// Asks a daemon for its status over and over on a connection of its own, to see whether
+/// something else the daemon is doing keeps it from answering.
+struct Asking {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: std::thread::JoinHandle<(Duration, u32)>,
+}
+
+impl Asking {
+    fn start(env: &Env) -> Asking {
+        let mut conn = env.connect();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let (mut longest, mut answers) = (Duration::ZERO, 0);
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                let asked = Instant::now();
+                conn.state();
+                longest = longest.max(asked.elapsed());
+                answers += 1;
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            (longest, answers)
+        });
+        Asking { stop, thread }
+    }
+
+    /// The longest it waited for an answer, and how many answers it got.
+    fn stop(self) -> (Duration, u32) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.join().unwrap()
+    }
+}
+
+/// How long the daemon may leave a request waiting while it does something else. What it
+/// guards against takes seconds; what is normal takes a few milliseconds.
+const KEPT_WAITING: Duration = Duration::from_secs(1);
+
+/// The name of a group is in the file once, however many entries the group has. In the index
+/// it is once as well, and cut to a length that is not the file's to choose. With the name
+/// in every entry, this file of half a megabyte asked for an index of more than a gigabyte,
+/// and a daemon that cannot have that much is gone: on unlock, and on the reload that
+/// follows when a sync peer saves such a file over the open one.
+#[test]
+fn a_group_name_is_in_the_index_once() {
+    use std::os::unix::process::CommandExt;
+    let env = Env::new();
+    let mut serve = env.command(&["serve"]);
+    // Room for this database several times over, and less than half of what the index took.
+    let room: libc::rlim_t = 512 << 20;
+    unsafe {
+        serve.pre_exec(move || {
+            let limit = libc::rlimit { rlim_cur: room, rlim_max: room };
+            match libc::setrlimit(libc::RLIMIT_DATA, &limit) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let _daemon = env.serve_with(serve);
+    let mut conn = env.connect();
+
+    let mut db = Database::new();
+    {
+        let mut root = db.root_mut();
+        let mut group = root.add_group();
+        group.name = "g".repeat(64 << 10);
+        for i in 0..20_000 {
+            group.add_entry().set_unprotected("Title", format!("Entry {i}"));
+        }
+    }
+    let named = env.dir.path().join("Named.kdbx");
+    save(db, &named);
+    assert!(std::fs::metadata(&named).unwrap().len() < 1 << 20);
+
+    let check = |conn: &mut Conn| {
+        assert_eq!(conn.state()["entryCount"], 20_000);
+        let found = conn.request("search", json!({"query": "'19999"}));
+        assert_eq!(
+            (found["total"].clone(), found["entries"][0]["title"].clone()),
+            (json!(1), json!("Entry 19999"))
+        );
+        let group = found["entries"][0]["group"].as_str().unwrap();
+        assert!(group.len() <= 256 && group.starts_with("ggg") && group.ends_with('…'), "{group}");
+    };
+    assert_eq!(unlock(&mut conn, &named, None)["ok"], true);
+    check(&mut conn);
+    assert_eq!(conn.request("lock", json!({}))["ok"], true);
+
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    assert_eq!(conn.state()["entryCount"], 7);
+    // What the first unlock announced is not what is waited for below.
+    conn.events.clear();
+    let tmp = db.with_extension("tmp");
+    std::fs::copy(&named, &tmp).unwrap();
+    std::fs::rename(&tmp, &db).unwrap();
+    conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 20_000);
+    check(&mut conn);
+}
+
+/// A search takes as long as there is text to look through, and how much there is is up to
+/// the database. Everything else is answered while a search goes on, and a lock ends it.
+#[test]
+fn a_search_keeps_nothing_waiting() {
+    let env = Env::new();
+    let _daemon = env.serve();
+    let mut conn = env.connect();
+
+    // Notes that are not plain ASCII, with the words that are looked for at their very end.
+    let mut db = Database::new();
+    {
+        let mut root = db.root_mut();
+        for i in 0..600 {
+            let mut entry = root.add_entry();
+            entry.set_unprotected("Title", format!("Entry {i}"));
+            entry.set_unprotected("Notes", format!("{} last words", "ž".repeat(8000)));
+        }
+    }
+    let path = env.dir.path().join("Notes.kdbx");
+    save(db, &path);
+    assert_eq!(unlock(&mut conn, &path, None)["ok"], true);
+    let query = json!({"query": "last words ords", "limit": 500});
+
+    let asking = Asking::start(&env);
+    let started = Instant::now();
+    let found = conn.request("search", query.clone());
+    let took = started.elapsed();
+    let (longest, answers) = asking.stop();
+    assert_eq!((found["ok"].clone(), found["total"].clone()), (json!(true), json!(600)), "{found}");
+    // A daemon that does nothing else while it searches answers when the search is over.
+    assert!(longest < KEPT_WAITING.min(took / 2), "an answer took {longest:?} during a search of {took:?}");
+    // The search was long enough for the question to mean something.
+    assert!(answers >= 10, "{answers} answers during a search of {took:?}");
+
+    // A lock in the middle of a search does not wait for it, and ends it.
+    let search = conn.send("search", query);
+    std::thread::sleep(took / 4);
+    let mut other = env.connect();
+    let started = Instant::now();
+    assert_eq!(other.request("lock", json!({}))["ok"], true);
+    let locked_after = started.elapsed();
+    assert!(locked_after < KEPT_WAITING, "the lock took {locked_after:?}");
+    // The search stops there, with three quarters of its work not done, instead of going
+    // through the rest of the entries it still holds.
+    assert_eq!(conn.reply(search)["error"], "locked");
+    let ended_after = started.elapsed();
+    assert!(ended_after < took / 2, "the search went on for {ended_after:?} of its {took:?}");
+}
+
+/// A database that is saved over the open one is taken over and indexed without the daemon
+/// standing still for it, whatever its shape: here forty thousand entries a hundred groups
+/// deep, where asking every group above every entry is four million questions.
+#[test]
+fn a_reload_keeps_nothing_waiting() {
+    let env = Env::new();
+    let _daemon = env.serve();
+    let mut conn = env.connect();
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+
+    let mut deep = Database::new();
+    let mut at = deep.root().id();
+    for _ in 0..100 {
+        at = deep.group_mut(at).unwrap().add_group().id();
+    }
+    {
+        let mut deepest = deep.group_mut(at).unwrap();
+        for _ in 0..40_000 {
+            deepest.add_entry();
+        }
+    }
+    let tmp = db.with_extension("tmp");
+    save(deep, &tmp);
+
+    let asking = Asking::start(&env);
+    std::fs::rename(&tmp, &db).unwrap();
+    conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 40_000);
+    let (longest, _) = asking.stop();
+    assert!(longest < KEPT_WAITING, "an answer took {longest:?} during the reload");
+}
+
 /// A database that is replaced while its unlock is still running: the unlock opens the copy its
 /// helper had read, and the new one is loaded right after it instead of going unnoticed.
 #[test]

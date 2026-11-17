@@ -98,7 +98,10 @@ A `state` event is sent right after a client connects and after every state chan
 | `quit` | — | `{}` (the daemon locks, wipes and exits) | — |
 
 `search` with an empty query returns the most recently / frequently used entries
-(at most `recentCount` of them, possibly none).
+(at most `recentCount` of them, possibly none). A search over a large database is done a
+little at a time, and other requests are answered in between: the replies to two searches
+can arrive in either order, so go by `id`. A lock that arrives while a search is under way
+ends it, and it fails with `locked`.
 
 A lock always wins over an unlock that is still running. If `lock`, `close` or an automatic
 lock (idle, screen lock, suspend) arrives while an `unlock` or `quickUnlock` is in progress, the
@@ -132,7 +135,9 @@ it waits the same way for up to 2 s.
 
 ### Entry (search result)
 
-Never contains secrets: no password, notes, custom field values or TOTP secret.
+Never contains secrets: no password, notes, custom field values or TOTP secret. `title` and
+`username` are at most 1 KiB and `group` at most 256 bytes long: what is longer in the
+database is cut and marked with `…` (a group path at its beginning, the others at their end).
 
 ```json
 {

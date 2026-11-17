@@ -18,9 +18,9 @@ use crate::inflight::Tracker;
 use crate::opener::Opener;
 use crate::protocol::{ApiError, Reply, args, ok, ok_with};
 use crate::quickunlock::{self, QuickBlob};
-use crate::search::Searcher;
+use crate::search::{self, Query, Searcher};
 use crate::state::Store;
-use crate::vault::{self, KeyMaterial, OpenDb, Stamp, VaultError};
+use crate::vault::{self, Index, KeyMaterial, OpenDb, Stamp, VaultError};
 use crate::{paths, portal, totp, watch};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +82,6 @@ pub struct Core {
     lock_reason: Option<LockReason>,
     last_activity: Instant,
     store: Store,
-    searcher: Searcher,
     watcher: Option<watch::Watcher>,
 }
 
@@ -108,6 +107,10 @@ const LAST_MOMENT: Duration = Duration::from_millis(200);
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_QUERY_ATOMS: usize = 16;
+
+/// How long a search goes on before it lets the rest of the daemon have a turn, a lock above
+/// all. It then finishes the entry it is on, whose texts have a fixed length at most.
+const SEARCH_STEP: Duration = Duration::from_millis(2);
 
 /// Test hook: with the environment variable `name` set to a FIFO, an unlock blocks there until
 /// the test writes to it, so a lock can be sent while the unlock is in flight.
@@ -187,8 +190,6 @@ impl Core {
     /// result would otherwise reopen the database after this lock.
     fn lock(&mut self, reason: LockReason) -> bool {
         self.watcher = None;
-        // With whatever its scratch memory still had of the texts it last matched.
-        self.searcher = Searcher::default();
         self.epoch += 1;
         self.epoch_tx.send_replace(self.epoch);
         if reason.wipes_quick_unlock() {
@@ -347,10 +348,12 @@ enum Prepared {
     Type { tokens: Vec<autotype::Token> },
 }
 
-/// What a helper produced: the decrypted database, the credentials that open the file (the
-/// password together with the key file as the helper read it) and the file's stamp.
+/// What a helper produced: the decrypted database with its index, the credentials that open
+/// the file (the password together with the key file as the helper read it) and the file's
+/// stamp.
 struct Opened {
     db: Database,
+    index: Index,
     key: KeyMaterial,
     stamp: Stamp,
 }
@@ -400,7 +403,6 @@ impl Daemon {
                 lock_reason: None,
                 last_activity: Instant::now(),
                 store: Store::load(state_dir),
-                searcher: Searcher::default(),
                 watcher: None,
             }),
             events,
@@ -578,16 +580,21 @@ impl Daemon {
         };
         // Taking the hand-over apart is parsing in memory, of a size the helper keeps bounded
         // whatever the file says (see `opener`): milliseconds as a rule, about two thirds of
-        // a second at the limit. It is waited for rather than raced against a lock, so that nothing
-        // decrypted is ever left on a thread nobody waits for; the caller checks the epoch
-        // before it installs the result.
+        // a second at the limit. The index is built in the same go, which costs a tenth of
+        // that: on this thread it would keep the whole daemon waiting, a lock included. Both
+        // are waited for rather than raced against a lock, so that nothing decrypted is ever
+        // left on a thread nobody waits for; the caller checks the epoch before it installs
+        // the result.
         let unsealing = tokio::task::spawn_blocking(move || {
             test_hold("OMAKEEPICK_TEST_HOLD_HANDOVER");
-            handover.unseal()
+            handover.unseal().map(|(db, key)| {
+                let index = Index::build(&db);
+                (db, index, key)
+            })
         });
-        let (db, key) =
+        let (db, index, key) =
             unsealing.await.unwrap_or_else(|e| Err(VaultError::Io(format!("Database helper: {e}"))))?;
-        Ok(Opened { db, key, stamp })
+        Ok(Opened { db, index, key, stamp })
     }
 
     /// Both steps in a row, for an unlock: `read_files`, then `decrypt`.
@@ -698,7 +705,6 @@ impl Daemon {
                 self.emit_state();
                 ok()
             }
-            "search" => self.search(args(line)?),
             "quit" => {
                 self.quit.notify_one();
                 ok()
@@ -708,7 +714,7 @@ impl Daemon {
     }
 
     pub fn is_async(cmd: &str) -> bool {
-        matches!(cmd, "unlock" | "quickUnlock" | "act" | "pickFile")
+        matches!(cmd, "unlock" | "quickUnlock" | "act" | "pickFile" | "search")
     }
 
     /// Commands that may take a while; replies can overtake each other.
@@ -722,34 +728,64 @@ impl Daemon {
             "unlock" => self.unlock(parsed(line)?).await,
             "quickUnlock" => self.quick_unlock(parsed(line)?).await,
             "act" => self.act(parsed(line)?).await,
+            "search" => self.search(parsed(line)?).await,
             "pickFile" => self.pick_file(parsed(line)?).await,
             other => Err(ApiError::new("unknown_command", format!("Unknown command {other}"))),
         }
     }
 
-    fn search(&self, a: SearchArgs) -> Reply {
-        // Scoring is linear in atoms × entries and runs on the one runtime thread.
+    /// How long a search takes goes by the text in the database. It is done a step at a time
+    /// on the one runtime thread, and everything else gets a turn between the steps. A lock
+    /// that comes in the middle ends the search at its next step, and the entries it was
+    /// working on (their notes are wiped when dropped) go with it.
+    async fn search(self: &Arc<Self>, a: SearchArgs) -> Reply {
         if a.query.len() > MAX_QUERY_BYTES {
             return Err(ApiError::bad_request("The query is too long"));
         }
         let query: String = a.query.split_whitespace().take(MAX_QUERY_ATOMS).collect::<Vec<_>>().join(" ");
-        let mut guard = self.core();
-        let core = &mut *guard;
-        let Some(open) = &core.open else { return Err(ApiError::locked()) };
+        let query = Query::parse(&query);
         let limit = a.limit.unwrap_or(50).clamp(1, 500);
-        let empty = Default::default();
-        let usage = core.store.usage(&open.path).unwrap_or(&empty);
-        let (hits, total) =
-            core.searcher.search(&open.index, &query, usage, limit, core.settings.recent_count, unix_now());
+        let (index, usage, recent, epoch) = {
+            let core = self.core();
+            let Some(open) = &core.open else { return Err(ApiError::locked()) };
+            let usage = core.store.usage(&open.path).cloned().unwrap_or_default();
+            (open.index.entries(), usage, core.settings.recent_count, core.epoch)
+        };
+        // A suspend waits until this has let go of the entries.
+        let _inflight = self.inflight.hold();
+        let now = unix_now();
+        let (hits, total) = if query.is_empty() {
+            search::recently_used(&index, &usage, limit, recent, now)
+        } else {
+            let mut searcher = Searcher::default();
+            searcher.begin(&index);
+            let mut from = 0;
+            loop {
+                let started = Instant::now();
+                let enough = || started.elapsed() >= SEARCH_STEP;
+                from = searcher.score(&query, &index, from, &usage, now, enough);
+                if from == index.len() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                if !self.still(epoch) {
+                    return Err(ApiError::locked());
+                }
+            }
+            searcher.best(&index, limit)
+        };
+        if !self.still(epoch) {
+            return Err(ApiError::locked());
+        }
         let entries: Vec<Value> = hits
             .into_iter()
             .map(|i| {
-                let e = &open.index[i];
+                let e = &index[i];
                 json!({
                     "id": e.uuid,
                     "title": e.title,
                     "username": e.username,
-                    "group": e.group,
+                    "group": &*e.group,
                     "hasUsername": !e.username.is_empty(),
                     "hasPassword": e.has_password,
                     "hasUrl": !e.url.is_empty(),
@@ -758,8 +794,7 @@ impl Daemon {
                 })
             })
             .collect();
-        core.touch();
-        drop(guard);
+        self.core().touch();
         self.idle_wakeup.notify_one();
         ok_with(json!({"entries": entries, "total": total}))
     }
@@ -802,8 +837,7 @@ impl Daemon {
         }
         let path = open.path.clone();
         core.store.remember(&path, open.keyfile.as_deref());
-        let live: std::collections::HashSet<String> = open.index.iter().map(|e| e.uuid.clone()).collect();
-        core.store.prune_usage(&path, |uuid| live.contains(uuid));
+        core.store.prune_usage(&path, |uuid| open.indexed(uuid).is_some());
         core.open_stamp = Some(stamp);
         core.watcher = None;
         core.open = Some(open);
@@ -839,15 +873,15 @@ impl Daemon {
         let result = match self.open_database(&path, keyfile.as_deref(), key, epoch).await {
             // Locked in the instant after the helper finished: stop before the PIN work.
             Ok(_) if !self.still(epoch) => Err(OpenError::Cancelled),
-            Ok(Opened { db, key, stamp }) => {
+            Ok(Opened { db, index, key, stamp }) => {
                 let (p, k) = (path.clone(), keyfile);
-                // The PIN's own Argon2id and the index: fixed-cost work in memory.
+                // The PIN's own Argon2id: fixed-cost work in memory.
                 tokio::task::spawn_blocking(move || -> Result<OpenDb, VaultError> {
                     let quick = pin
                         .map(|pin| QuickBlob::seal(&pin, &key, p.as_os_str().as_bytes()))
                         .transpose()
                         .map_err(VaultError::Io)?;
-                    Ok(OpenDb::new(p, k, key, quick, db))
+                    Ok(OpenDb::with_index(p, k, key, quick, db, index))
                 })
                 .await
                 .unwrap_or_else(|e| Err(VaultError::Io(format!("Unlock task failed: {e}"))))
@@ -925,8 +959,8 @@ impl Daemon {
             None => None,
         };
         match opened {
-            Some(Ok(Opened { db, key, stamp })) => {
-                let open = OpenDb::new(path, keyfile, key, Some(blob), db);
+            Some(Ok(Opened { db, index, key, stamp })) => {
+                let open = OpenDb::with_index(path, keyfile, key, Some(blob), db, index);
                 if let Some(rejected) = self.install(open, stamp, epoch) {
                     // A lock that keeps quick unlock (screen, idle, manual) gets the PIN key
                     // back; sleep and close have wiped it.
@@ -1209,7 +1243,7 @@ impl Daemon {
                         return;
                     }
                     let Some(open) = core.open.as_mut().filter(|o| o.path == path) else { return };
-                    open.replace_database(opened.db);
+                    open.replace_database(opened.db, opened.index);
                     let count = open.index.len();
                     core.open_stamp = Some(opened.stamp);
                     drop(core);

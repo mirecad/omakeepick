@@ -205,7 +205,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     hand-over is the one piece of work on the database the daemon does itself, on a thread a
     lock cannot stop, so its size is not left to the file: more than 32 MiB (some forty
     thousand entries) is refused, which keeps it to about two thirds of a second at worst
-    and a few milliseconds for an ordinary database.
+    and a few milliseconds for an ordinary database. The search index is built in the same
+    go. It takes a fixed length of every text at most and a group's path once, however many
+    entries the group has, so it is no larger than the hand-over allows either.
+  - Nothing waits for a search. How long one takes goes by how much text the database has,
+    so the daemon searches for two milliseconds at a time and attends to everything else in
+    between. A lock that arrives in the middle ends the search.
   - The file does not decide how much memory the helper takes. A KeePass database is saved
     compressed, and nothing in the file says what it unpacks to: a megabyte of file can hold
     a gigabyte of attachment, and the parser unpacks all of it before anything can be left
@@ -277,6 +282,8 @@ Found a vulnerability? Please report it privately, as described in [SECURITY.md]
   not counting its key derivation. That is enough for any file of that size whose attachments
   do not compress. Attachments that compress well fit up to a few hundred megabytes unpacked.
 - Argon2 is accepted with up to 1 GiB of memory (KeePassXC's default is 64 MiB).
+- Search looks at the first 16 KiB of an entry's notes and the first 1 KiB of its title, user
+  name, URL and tags. A group path longer than 256 bytes is shown, and searched, from its end.
 
 ## Development
 

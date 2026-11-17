@@ -49,7 +49,7 @@ fn indexes_searchable_entries_only() {
     );
     let entries = by_title(&open);
     let github = &entries["GitHub"];
-    assert_eq!(github.group, "Personal/Dev");
+    assert_eq!(&*github.group, "Personal/Dev");
     assert_eq!(github.username, "madev");
     assert_eq!(github.url_match, "github.com/login");
     assert_eq!(github.tags, "code git");
@@ -243,7 +243,7 @@ async fn the_helper_hands_over_the_same_database() {
         let direct = OpenDb::new(path.clone(), None, whole.clone(), None, direct);
         let handed_over = OpenDb::new(path.clone(), None, whole, None, unlocked);
         assert_eq!(direct.index.len(), 7, "{}", path.display());
-        for (a, b) in direct.index.iter().zip(&handed_over.index) {
+        for (a, b) in direct.index.iter().zip(handed_over.index.iter()) {
             assert_eq!(
                 (&a.uuid, &a.title, &a.username, &a.url, &a.group, &a.tags, &*a.notes),
                 (&b.uuid, &b.title, &b.username, &b.url, &b.group, &b.tags, &*b.notes)
@@ -340,7 +340,7 @@ async fn a_keepassxc_database_is_handed_over_without_its_extras() {
         contents(&handed_over)
     });
     let open = OpenDb::new(path, None, password(PASSWORD), None, handed_over);
-    let found: Vec<(&str, &str)> = open.index.iter().map(|e| (e.title.as_str(), e.group.as_str())).collect();
+    let found: Vec<(&str, &str)> = open.index.iter().map(|e| (e.title.as_str(), &*e.group)).collect();
     assert_eq!(found, [("Plain", ""), ("Webmail", "Mail")]);
     let webmail = open.entry(&open.index[1].uuid).unwrap();
     assert_eq!(webmail.get_password(), Some("the-current-password"));
