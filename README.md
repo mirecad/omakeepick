@@ -206,6 +206,16 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     lock cannot stop, so its size is not left to the file: more than 32 MiB (some forty
     thousand entries) is refused, which keeps it to about two thirds of a second at worst
     and a few milliseconds for an ordinary database.
+  - The file does not decide how much memory the helper takes. A KeePass database is saved
+    compressed, and nothing in the file says what it unpacks to: a megabyte of file can hold
+    a gigabyte of attachment, and the parser unpacks all of it before anything can be left
+    out. So before the helper is given the password, it has the kernel limit its memory
+    (`RLIMIT_DATA`, which it cannot raise again) to 1 GiB plus what the file's key derivation
+    is set to use. That setting is itself refused above 1 GiB. A database that needs more is
+    not opened, and the unlock says so. The same goes for one that a sync peer saves over
+    the database you have open: it is not loaded, and the one you had stays. Should the
+    machine be short of memory for other reasons, the helper is the process the kernel
+    takes first.
   - Copying and typing hold as little as they can, and a lock ends them wherever they are.
     - Auto-type takes a field's value from the database when that field's turn comes, and
       drops it once it is typed. The wait before typing, a `{DELAY}` and the key presses in
@@ -263,6 +273,10 @@ Found a vulnerability? Please report it privately, as described in [SECURITY.md]
   not lock the database. Suspend and `loginctl lock-session` are detected instantly.
 - One database at a time, with at most 32 MiB of entries (some forty thousand), not counting
   attachments and entry histories.
+- The database file can be up to 128 MiB, and opening it can take up to 1 GiB of memory,
+  not counting its key derivation. That is enough for any file of that size whose attachments
+  do not compress. Attachments that compress well fit up to a few hundred megabytes unpacked.
+- Argon2 is accepted with up to 1 GiB of memory (KeePassXC's default is 64 MiB).
 
 ## Development
 

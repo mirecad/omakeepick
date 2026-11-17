@@ -15,6 +15,8 @@ use keepass::{Database, DatabaseKey};
 use serde_json::{Value, json};
 use zbus::{ObjectPath, OwnedVariant, Variant};
 
+mod kdbx4;
+
 const BIN: &str = env!("CARGO_BIN_EXE_omakeepickd");
 const PASSWORD: &str = "test-password";
 
@@ -726,6 +728,37 @@ fn reloads_when_the_file_changes() {
     conn.wait_event("reload", |m| m["event"] == "state" && m["entryCount"] == 8);
     let found = conn.request("search", json!({"query": "brand new"}));
     assert_eq!(found["entries"][0]["title"], "Brand new");
+}
+
+/// A database that unpacks to gigabytes (see `tests/vault.rs`) costs an unlock and nothing
+/// more. Unlocking it fails with what is wrong with it. Saved over the database that is open,
+/// as a sync peer could do it, it is not loaded, and the one that was open stays open.
+#[test]
+fn a_database_that_unpacks_to_gigabytes_is_not_opened() {
+    let env = Env::new();
+    let _daemon = env.serve();
+    let mut conn = env.connect();
+    let unpacks_to_gigabytes = kdbx4::with_attachment(PASSWORD, 2 << 30, 8 << 20);
+
+    let large = env.dir.path().join("Large.kdbx");
+    std::fs::write(&large, &unpacks_to_gigabytes).unwrap();
+    let refused = unlock(&mut conn, &large, None);
+    assert_eq!((refused["ok"].clone(), refused["error"].clone()), (json!(false), json!("format_error")));
+    assert_eq!(
+        refused["message"],
+        "Not a readable KeePass database: it takes more than 1 GiB of memory to open"
+    );
+    assert_eq!(conn.request("search", json!({"query": "git"}))["error"], "locked");
+
+    let db = env.db_copy();
+    assert_eq!(unlock(&mut conn, &db, None)["ok"], true);
+    let tmp = db.with_extension("tmp");
+    std::fs::write(&tmp, &unpacks_to_gigabytes).unwrap();
+    std::fs::rename(&tmp, &db).unwrap();
+    conn.wait_event("the refusal", |m| m["event"] == "notice" && m["level"] == "warning");
+    assert_eq!(conn.state()["entryCount"], 7);
+    let found = conn.request("search", json!({"query": "git"}));
+    assert_eq!((found["total"].clone(), found["entries"][0]["title"].clone()), (json!(3), json!("GitHub")));
 }
 
 /// A database that is replaced while its unlock is still running: the unlock opens the copy its

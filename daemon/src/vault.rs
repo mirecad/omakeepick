@@ -148,8 +148,15 @@ fn map_open_error(err: DatabaseOpenError) -> VaultError {
 
 /// Largest files we read. Real databases and key files are far smaller; without a cap a
 /// device node or a sparse file would be read into memory whole.
-const MAX_DATABASE_BYTES: u64 = 256 << 20;
+///
+/// Opening a database takes about six times its size in memory when its contents do not
+/// compress. At this size that is some 800 MiB, which the helper's limit
+/// (`opener::HELPER_ROOM_BYTES`) leaves room for.
+pub const MAX_DATABASE_BYTES: u64 = 128 << 20;
 const MAX_KEYFILE_BYTES: u64 = 16 << 20;
+
+/// The most memory a key derivation may ask for and still be run.
+pub const MAX_KDF_MEMORY_BYTES: u64 = header::MAX_ARGON2_MEMORY;
 
 /// When the database file was last written and how big it is, as of the moment it was read.
 /// Tells a real change from a spurious file event.
@@ -235,8 +242,10 @@ pub fn read_database(path: &Path) -> Result<(Zeroizing<Vec<u8>>, Stamp), VaultEr
 }
 
 /// The header check alone (see `header`). Needs no key, so a file with absurd derivation
-/// settings can be refused before anyone is given the credentials.
-pub fn check_header(data: &[u8]) -> Result<(), VaultError> {
+/// settings can be refused before anyone is given the credentials. Returns how much memory
+/// the file's key derivation is set to use, in bytes: at most [`MAX_KDF_MEMORY_BYTES`], and
+/// nothing for the AES derivation.
+pub fn check_header(data: &[u8]) -> Result<u64, VaultError> {
     header::check(data)
 }
 
@@ -285,7 +294,9 @@ mod header {
 
     /// Far above anything KeePassXC offers, well below "forever".
     const MAX_AES_ROUNDS: u64 = 1 << 34;
-    const MAX_ARGON2_MEMORY: u64 = 4 << 30;
+    /// KeePassXC writes 64 MiB unless told otherwise. This much is allocated on the word of a
+    /// header nobody has authenticated yet, so it is a size a desktop can spare.
+    pub(super) const MAX_ARGON2_MEMORY: u64 = 1 << 30;
     const MAX_ARGON2_ITERATIONS: u64 = 1_000;
     const MAX_ARGON2_PARALLELISM: u32 = 256;
     /// memory × iterations, in bytes·passes: 64 MiB × 1000 passes, about a minute of work.
@@ -315,18 +326,20 @@ mod header {
         Ok(u64::from_le_bytes(data.get(at..at + 8).ok_or_else(damaged)?.try_into().expect("8 bytes")))
     }
 
-    pub fn check(data: &[u8]) -> Result<(), VaultError> {
+    /// Returns the memory the key derivation is set to use, in bytes.
+    pub fn check(data: &[u8]) -> Result<u64, VaultError> {
         // Not KDBX 3/4 at all: let the crate name the problem (KDB 1, not a database, …).
         if data.get(..8) != Some(&KDBX_SIGNATURE[..]) {
-            return Ok(());
+            return Ok(0);
         }
         let major = u16::from_le_bytes(data.get(10..12).ok_or_else(damaged)?.try_into().expect("2 bytes"));
         let length_bytes = match major {
             3 => 2,
             4 => 4,
-            _ => return Ok(()),
+            _ => return Ok(0),
         };
         let mut pos = 12;
+        let mut memory = 0;
         loop {
             let kind = *data.get(pos).ok_or_else(damaged)?;
             let len = if length_bytes == 2 {
@@ -341,7 +354,7 @@ mod header {
             let field = data.get(start..end).ok_or_else(damaged)?;
             pos = end;
             match (major, kind) {
-                (_, 0) => return Ok(()),
+                (_, 0) => return Ok(memory),
                 // Compression flags and (KDBX 3) the inner stream id are read as u32.
                 (_, 3) | (3, 10) if field.len() < 4 => return Err(damaged()),
                 // KDBX 3: transform rounds.
@@ -351,7 +364,8 @@ mod header {
                     }
                 }
                 // KDBX 4: KDF parameters and public custom data are variant dictionaries.
-                (4, 11) => check_kdf(&variant_dictionary(field)?)?,
+                // Should the field come twice, whichever the crate goes by is covered.
+                (4, 11) => memory = memory.max(check_kdf(&variant_dictionary(field)?)?),
                 (4, 12) => {
                     variant_dictionary(field)?;
                 }
@@ -407,9 +421,11 @@ mod header {
         Ok(out)
     }
 
-    fn check_kdf(params: &[(String, Value)]) -> Result<(), VaultError> {
+    /// Returns the memory these settings make the derivation use, in bytes. Settings the
+    /// crate will refuse (a parameter missing, or of another type than it reads) use none.
+    fn check_kdf(params: &[(String, Value)]) -> Result<u64, VaultError> {
         let get = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v);
-        let Some(Value::Bytes(uuid)) = get("$UUID") else { return Ok(()) };
+        let Some(Value::Bytes(uuid)) = get("$UUID") else { return Ok(0) };
         if uuid[..] == AES_KDF || uuid[..] == AES_KDF_KDBX4 {
             if let Some(Value::U64(rounds)) = get("R")
                 && *rounds > MAX_AES_ROUNDS
@@ -419,15 +435,15 @@ mod header {
         } else if uuid[..] == ARGON2D || uuid[..] == ARGON2ID {
             let memory = match get("M") {
                 Some(Value::U64(m)) => *m,
-                _ => return Ok(()),
+                _ => return Ok(0),
             };
             let iterations = match get("I") {
                 Some(Value::U64(i)) => *i,
-                _ => return Ok(()),
+                _ => return Ok(0),
             };
             let parallelism = match get("P") {
                 Some(Value::U32(p)) => *p,
-                _ => return Ok(()),
+                _ => return Ok(0),
             };
             if memory > MAX_ARGON2_MEMORY
                 || iterations > MAX_ARGON2_ITERATIONS
@@ -436,8 +452,9 @@ mod header {
             {
                 return Err(too_expensive());
             }
+            return Ok(memory);
         }
-        Ok(())
+        Ok(0)
     }
 
     #[cfg(test)]
@@ -460,7 +477,8 @@ mod header {
 
         #[test]
         fn accepts_the_fixture() {
-            check(KDBX3).unwrap();
+            // Written by KeePassXC with the AES derivation, which takes no memory to speak of.
+            assert_eq!(check(KDBX3), Ok(0));
         }
 
         #[test]
@@ -529,8 +547,10 @@ mod header {
                     ("V", Value::U32(0x13)),
                 ])
             };
-            check(&argon(64 << 20, 10, 2)).unwrap();
-            check(&argon(1 << 30, 32, 8)).unwrap();
+            // What passes is reported: the helper's memory limit is made of it.
+            assert_eq!(check(&argon(64 << 20, 10, 2)), Ok(64 << 20));
+            assert_eq!(check(&argon(1 << 30, 32, 8)), Ok(1 << 30));
+            assert_eq!(check(&argon((1 << 30) + 1024, 1, 1)), Err(too_expensive()));
             assert_eq!(check(&argon(1 << 40, 1, 1)), Err(too_expensive()));
             assert_eq!(check(&argon(64 << 20, 100_000, 1)), Err(too_expensive()));
             assert_eq!(check(&argon(64 << 20, 1, 1 << 20)), Err(too_expensive()));
@@ -544,7 +564,7 @@ mod header {
                         ("R", Value::U64(rounds)),
                     ])
                 };
-                check(&aes(60_000_000)).unwrap();
+                assert_eq!(check(&aes(60_000_000)), Ok(0));
                 assert_eq!(check(&aes(u64::MAX)), Err(too_expensive()));
             }
             // A u64 parameter that is only 2 bytes long would panic the crate's reader.
@@ -592,6 +612,39 @@ mod header {
             field.extend(vd);
             data.splice(end..end, field);
             assert_eq!(check(&data), Err(repeated_key()));
+        }
+
+        /// A header can carry the whole KDF field twice. Whichever of the two the crate goes
+        /// by, the memory reported has room for it.
+        #[test]
+        fn reports_the_larger_of_two_kdf_fields() {
+            let argon = |memory: u64| {
+                kdbx4(&[
+                    ("$UUID", Value::Bytes(ARGON2ID.to_vec())),
+                    ("S", Value::Bytes(vec![0; 32])),
+                    ("M", Value::U64(memory)),
+                    ("I", Value::U64(1)),
+                    ("P", Value::U32(1)),
+                    ("V", Value::U32(0x13)),
+                ])
+            };
+            // Where `kdbx4` puts the KDF field: after the signature, the version and four
+            // fields of 16, 4, 32 and 12 bytes; the end field of 9 bytes follows it.
+            let kdf_at = 12 + (5 + 16) + (5 + 4) + (5 + 32) + (5 + 12);
+            for (first, second) in [(64 << 20, 256 << 20), (256 << 20, 64 << 20)] {
+                let mut data = argon(first);
+                let other = argon(second);
+                assert_eq!(other[kdf_at], 11);
+                let end = data.len() - 9;
+                data.splice(end..end, other[kdf_at..other.len() - 9].iter().copied());
+                assert_eq!(check(&data), Ok(256 << 20));
+            }
+            // And each of the two has to pass on its own.
+            let mut data = argon(64 << 20);
+            let other = argon(1 << 40);
+            let end = data.len() - 9;
+            data.splice(end..end, other[kdf_at..other.len() - 9].iter().copied());
+            assert_eq!(check(&data), Err(too_expensive()));
         }
     }
 }

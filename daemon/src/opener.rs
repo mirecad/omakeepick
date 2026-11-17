@@ -33,6 +33,15 @@
 //! KDF. That key and the credentials travel on the same pipe, ahead of the data; a pipe is
 //! kernel memory shared by nothing but these two processes.
 //!
+//! The file does not decide how much memory the child takes either. A database unpacks to
+//! whatever its contents unpack to (a megabyte of zeros is a kilobyte of file), and the
+//! parser unpacks it whole before anything here can look at it. So before the child answers
+//! in step 2, and so before it is given a credential, it puts a limit on its own memory
+//! (see `memory`): [`HELPER_ROOM_BYTES`] plus what the header says the key derivation uses,
+//! which `vault` caps. The kernel refuses what goes past that, wherever in the parser it is
+//! asked for, and the child ends with an error like any other. Should the machine be short
+//! of memory for other reasons, the child is the process the kernel takes first.
+//!
 //! Taking that hand-over apart is the one piece of work on the database that the daemon does
 //! itself, on a thread that a lock cannot stop. So its size is not left to the file either.
 //! The child first takes out what the daemon never uses (attachments, the earlier versions of
@@ -59,8 +68,8 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
-use crate::harden;
 use crate::vault::{self, KeyMaterial, Stamp, VaultError};
+use crate::{harden, memory};
 
 const SECRET_LEN: usize = 32;
 
@@ -117,8 +126,28 @@ pub const MAX_HANDOVER_DATABASE_BYTES: usize = 32 << 20;
 /// The whole hand-over: `[len32][key material][one-time key][database]`.
 const MAX_HANDOVER_BYTES: usize = 4 + MAX_CREDENTIAL_BYTES + SECRET_LEN + MAX_HANDOVER_DATABASE_BYTES;
 
-const TOO_LARGE: &str =
-    "The database is too large: more than 32 MiB even without its attachments and entry histories";
+/// These two go after "Not a readable KeePass database: ", like every `VaultError::Format`.
+const TOO_LARGE: &str = "it has more than 32 MiB of entries, not counting attachments and entry histories";
+
+/// The writable memory the child may have beside what its key derivation is set to use. An
+/// ordinary database takes a few megabytes of it. What takes more is attachments, which have
+/// to be unpacked before they can be left out: about six times the file's size when they do
+/// not compress (800 MiB for the largest file `vault` reads), twice their own size when they
+/// do. While the key is derived, the file and the stacks of the derivation's threads (2 MiB
+/// each, at most 256 of them) are all that is in here.
+pub const HELPER_ROOM_BYTES: u64 = 1 << 30;
+
+/// The error a child ends with when it runs into its limit. As a macro, so that the line
+/// the allocator writes for it can be put together at compile time: nothing can be put
+/// together once memory has run out.
+macro_rules! out_of_room {
+    () => {
+        "it takes more than 1 GiB of memory to open"
+    };
+}
+
+/// [`out_of_room`] as the child reports it: one line, a [`WireError`].
+const OUT_OF_ROOM_REPORT: &str = concat!(r#"{"code":"format_error","message":""#, out_of_room!(), "\"}\n");
 
 /// `[len32][database path][len32][key file path]`: the first thing the daemon writes to the
 /// child's stdin. An empty key file path means there is none. No secrets.
@@ -224,6 +253,8 @@ fn test_hold(name: &str) {
 /// `omakeepickd open-db`: the child. Speaks the protocol in the module documentation on stdin
 /// and stdout; a failure is a JSON [`WireError`] on stderr with exit status 1.
 pub fn open_db_main() -> ExitCode {
+    // Before the hardening, which takes /proc/self away from this process.
+    memory::first_to_go();
     // No core dumps, no ptrace by our other processes.
     harden::harden_process();
     unsafe {
@@ -258,8 +289,13 @@ fn serve_request() -> Result<(), VaultError> {
     // that could hang. The key file comes last: it is the one whose contents are a secret.
     test_hold("OMAKEEPICK_TEST_HOLD_READ");
     let (data, stamp) = vault::read_database(&path)?;
-    vault::check_header(&data)?;
+    let kdf_memory = vault::check_header(&data)?;
     let keyfile = keyfile.as_deref().map(vault::read_keyfile).transpose()?;
+    // What was allocated so far had its size checked first. From here on the file's contents
+    // decide what is asked for, so this process says how much it may get before it says it
+    // is ready for the credentials. Without the limit it goes no further.
+    memory::limit(HELPER_ROOM_BYTES + kdf_memory, OUT_OF_ROOM_REPORT.as_bytes())
+        .map_err(io("Cannot limit the memory of the database helper"))?;
     stdout.write_all(&stamp.to_bytes()).map_err(io("Cannot answer"))?;
 
     // The daemon sends the credentials once it has seen the stamp: `[len32][key material]`.
@@ -524,6 +560,18 @@ mod tests {
             assert_eq!(wire.into_error(), Some(err));
         }
         assert!(WireError { code: "nope".into(), message: String::new() }.into_error().is_none());
+    }
+
+    /// The report of a child that ran out of memory is written by hand, since nothing can be
+    /// serialized at that point. The daemon has to read it as the error it stands for.
+    #[test]
+    fn the_out_of_room_report_is_a_wire_error() {
+        let (line, rest) = OUT_OF_ROOM_REPORT.split_once('\n').unwrap();
+        assert_eq!(rest, "");
+        let wire: WireError = serde_json::from_str(line).unwrap();
+        assert_eq!(wire.into_error(), Some(VaultError::Format(out_of_room!().into())));
+        // The number in the message is the limit.
+        assert_eq!(HELPER_ROOM_BYTES, 1 << 30);
     }
 
     #[test]

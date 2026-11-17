@@ -8,10 +8,12 @@ use keepass::config::{DatabaseVersion, InnerCipherConfig, KdfConfig, OuterCipher
 use keepass::db::{Value, fields};
 use keepass::{Database, DatabaseKey};
 use omakeepickd::autotype::{self, Fields, Token};
-use omakeepickd::opener::Opener;
+use omakeepickd::opener::{self, Opener};
 use omakeepickd::totp;
 use omakeepickd::vault::{self, KeyMaterial, OpenDb, VaultError};
 use zeroize::Zeroizing;
+
+mod kdbx4;
 
 const BIN: &str = env!("CARGO_BIN_EXE_omakeepickd");
 const PASSWORD: &str = "test-password";
@@ -366,7 +368,7 @@ async fn the_hand_over_has_a_size_the_file_does_not_decide() {
     let mut db = Database::new();
     megabytes(&mut db, 40, 0);
     match through_the_helper(&db).await {
-        Err(VaultError::Format(message)) => assert!(message.contains("too large"), "{message}"),
+        Err(VaultError::Format(message)) => assert!(message.contains("more than 32 MiB"), "{message}"),
         other => panic!("{:?}", other.map(|db| db.num_entries())),
     }
 }
@@ -457,6 +459,97 @@ async fn the_helper_reads_the_files_before_it_is_given_credentials() {
         let refused = read(&path, None).await;
         assert!(matches!(refused, Some(VaultError::Format(_))), "{refused:?}");
     }
+}
+
+/// How much writable memory the running process `pid` may have, as the kernel has it: the
+/// limit it can reach and the limit it could raise that to.
+fn memory_limit(pid: u32) -> (u64, u64) {
+    let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
+    let line = limits.lines().find(|line| line.starts_with("Max data size")).unwrap();
+    let mut numbers = line.split_whitespace().skip(3).map(|n| n.parse::<u64>().expect("a limit in bytes"));
+    (numbers.next().unwrap(), numbers.next().unwrap())
+}
+
+/// The helper is not trusted with memory: what a file unpacks to is up to the file. By the
+/// time it reports the files as read, and so before it is sent a credential, it has put a
+/// limit on itself that it cannot lift: a gigabyte, and what the header says the key
+/// derivation uses.
+#[tokio::test]
+async fn the_helper_limits_its_memory_before_it_is_given_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let argon = kdbx4_copy(
+        dir.path(),
+        "argon2id.kdbx",
+        // As many threads as a header may ask for: their stacks count against the limit too.
+        KdfConfig::Argon2id {
+            iterations: 2,
+            memory: 16 << 20,
+            parallelism: 256,
+            version: rust_argon2::Version::Version13,
+        },
+        OuterCipherConfig::ChaCha20,
+    );
+    for (path, kdf_memory) in [(fixture("password.kdbx"), 0), (argon, 16 << 20)] {
+        let mut opener = Opener::spawn(Path::new(BIN), &path, None).await.unwrap();
+        opener.read().await.unwrap();
+        let pid = opener.id().unwrap();
+        let limit = opener::HELPER_ROOM_BYTES + kdf_memory;
+        assert_eq!(memory_limit(pid), (limit, limit), "{}", path.display());
+        // Should memory run out for some other reason, the kernel takes this process first.
+        let adjustment = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")).unwrap();
+        assert_eq!(adjustment.trim(), "1000");
+        // Under the limit it does its work as before.
+        let (db, _) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
+        assert_eq!(vault::build_index(&db).len(), 7);
+    }
+
+    // A session that allows its processes less than that is not a reason to fail, and its
+    // limit is not raised: the helper keeps the lower of the two.
+    use std::os::unix::fs::PermissionsExt;
+    let lower = 512 << 20;
+    let limited = dir.path().join("limited-helper");
+    std::fs::write(&limited, format!("#!/bin/sh\nexec prlimit --data={lower} {BIN} \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&limited, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut opener = Opener::spawn(&limited, &fixture("password.kdbx"), None).await.unwrap();
+    opener.read().await.unwrap();
+    assert_eq!(memory_limit(opener.id().unwrap()), (lower, lower));
+    let (db, _) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
+    assert_eq!(vault::build_index(&db).len(), 7);
+}
+
+/// A database is saved compressed, and nothing in the file says what it unpacks to: two
+/// megabytes of file can hold two gigabytes of attachment, and the parser unpacks all of it
+/// before the helper can leave the attachment out. The helper's limit ends that. It reports
+/// the database as one it cannot read, and says why.
+#[tokio::test]
+async fn a_database_that_unpacks_to_gigabytes_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let kdf_memory = 8 << 20;
+    let limit = opener::HELPER_ROOM_BYTES + kdf_memory;
+
+    // The same file with a megabyte attached opens, and the attachment stays behind in the
+    // helper. So nothing but the size is wrong with the one after it.
+    let small = dir.path().join("small.kdbx");
+    std::fs::write(&small, kdbx4::with_attachment(PASSWORD, 1 << 20, kdf_memory)).unwrap();
+    let (db, _) = open_in_helper(&small, None, password(PASSWORD)).await.unwrap();
+    let titles: Vec<String> = vault::build_index(&db).into_iter().map(|entry| entry.title).collect();
+    assert_eq!(titles, [kdbx4::TITLE]);
+    assert_eq!(db.num_attachments(), 0);
+
+    let large = dir.path().join("large.kdbx");
+    let file = kdbx4::with_attachment(PASSWORD, 2 << 30, kdf_memory);
+    assert!(file.len() < 4 << 20, "{} bytes", file.len());
+    std::fs::write(&large, file).unwrap();
+    let mut opener = Opener::spawn(Path::new(BIN), &large, None).await.unwrap();
+    opener.read().await.unwrap();
+    // Looked at before the helper is given the key to this file. A helper without the limit
+    // would go on to fill the memory of the machine the test runs on.
+    assert_eq!(memory_limit(opener.id().unwrap()), (limit, limit));
+    let started = std::time::Instant::now();
+    let refused = opener.decrypt(password(PASSWORD)).await.err();
+    assert_eq!(refused, Some(VaultError::Format("it takes more than 1 GiB of memory to open".into())));
+    // It ends where the limit is, well before the two minutes an unlock may take.
+    assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
 }
 
 /// The daemon's half of that order: it writes no credential until the helper has reported the

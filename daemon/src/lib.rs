@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod harden;
 pub mod inflight;
 pub mod locker;
+pub mod memory;
 pub mod opener;
 pub mod paths;
 pub mod portal;
@@ -21,3 +22,7 @@ pub mod tool;
 pub mod totp;
 pub mod vault;
 pub mod watch;
+
+/// See `memory`: the system allocator, except in a helper that ran into its limit.
+#[global_allocator]
+static ALLOCATOR: memory::Limited = memory::Limited;

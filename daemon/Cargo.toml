@@ -31,6 +31,9 @@ zbus = { version = "6", default-features = false, features = ["tokio", "proxy"] 
 zeroize = { version = "1", features = ["derive", "serde"] }
 
 [dev-dependencies]
+# These two write the test database that unpacks to gigabytes (tests/kdbx4).
+chacha20 = "0.10"
+flate2 = "1"
 keepass = { version = "0.17", features = ["save_kdbx4", "serialization"] }
 rust_argon2 = { package = "rust-argon2", version = "3" }
 tempfile = "3"
