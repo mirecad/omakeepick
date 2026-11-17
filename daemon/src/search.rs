@@ -39,12 +39,21 @@ pub fn frecency(usage: Option<&(u32, i64)>, now: i64) -> u32 {
     (f64::from(count).ln_1p() * 120.0 * 0.5f64.powf(age_days / 30.0)) as u32
 }
 
-/// `text` in lower case, in a buffer that is wiped and that never moves while it is filled,
-/// which would leave the beginning of the text behind in freed memory: a character's lower
-/// case is never more than twice as long as the character.
-fn lower_case(text: &str) -> Zeroizing<String> {
-    let mut lower = Zeroizing::new(String::with_capacity(text.len() * 2));
+/// Put after a text in which a substring is looked for. nucleo 0.3.1 does not try the last
+/// place a substring can start at in a text that is not plain ASCII, so it never finds a word
+/// that the text ends with. With this after it, no word is at the end. A query cannot contain
+/// it: the daemon takes queries apart at white space.
+const END: char = '\n';
+
+/// `text` in lower case, with [`END`] after it if `end` says so, in a buffer that is wiped and
+/// that never moves while it is filled, which would leave the beginning of the text behind in
+/// freed memory: a character's lower case is never more than twice as long as the character.
+fn lower_case(text: &str, end: bool) -> Zeroizing<String> {
+    let mut lower = Zeroizing::new(String::with_capacity(text.len() * 2 + END.len_utf8()));
     lower.extend(text.chars().flat_map(char::to_lowercase));
+    if end {
+        lower.push(END);
+    }
     lower
 }
 
@@ -82,7 +91,7 @@ impl Searcher {
         let haystack = if haystack.is_ascii() {
             haystack
         } else {
-            folded = lower_case(haystack);
+            folded = lower_case(haystack, atom.kind == AtomKind::Substring);
             folded.as_str()
         };
         atom.score(Utf32Str::new(haystack, &mut self.buf), &mut self.matcher).map(u32::from)
@@ -134,7 +143,8 @@ impl Searcher {
             .flat_map(|e| [&e.title, &e.username, &e.url_match, &e.group, &e.tags, &*e.notes])
             .map(String::len)
             .max();
-        self.buf.reserve(longest.unwrap_or(0));
+        // A text has no more characters than bytes, in lower case too; one more for `END`.
+        self.buf.reserve(longest.unwrap_or(0) + 1);
         let found = self.find(index, query, usage, limit, recent, now);
         self.buf.zeroize();
         found
@@ -242,9 +252,38 @@ mod tests {
         }
         // The ones that grow: two bytes become three.
         let text = "İstanbul ȺȾ Žilina";
-        let lower = lower_case(text);
+        let lower = lower_case(text, false);
         assert_eq!(lower.as_str(), "i\u{307}stanbul ⱥⱦ žilina");
-        assert_eq!(lower.capacity(), text.len() * 2);
+        assert_eq!(lower.capacity(), text.len() * 2 + 1);
+        let ended = lower_case(text, true);
+        assert_eq!(ended.as_str(), "i\u{307}stanbul ⱥⱦ žilina\n");
+        assert_eq!(ended.capacity(), text.len() * 2 + 1);
+    }
+
+    /// A word that a text ends with is found, in a text that is not plain ASCII as much as in
+    /// one that is: in notes, where every word is looked for as a substring, and in the other
+    /// fields when the query asks for one (`'word`).
+    #[test]
+    fn a_word_at_the_end_of_a_text_is_found() {
+        let index = vec![
+            entry("Kancelária Žilina", "", "", "", "kľúč je pod rohožkou"),
+            entry("Office", "", "", "", "the key is under the doormat"),
+        ];
+        let found = |query: &str| Searcher::default().search(&index, query, &Usage::new(), 10, 0, 0).0;
+        // In the notes: at the end, in the middle, a single letter that only the end has.
+        assert_eq!(found("rohozkou"), [0]);
+        assert_eq!(found("rohožkou"), [0]);
+        assert_eq!(found("pod"), [0]);
+        assert_eq!(found("doormat"), [1]);
+        // In a title, as a substring.
+        assert_eq!(found("'zilina"), [0]);
+        assert_eq!(found("'žilina"), [0]);
+        assert_eq!(found("'office"), [1]);
+        // Asked for at the end, the end is still where the text ends.
+        assert_eq!(found("zilina$"), [0]);
+        assert_eq!(found("kancelaria$"), Vec::<usize>::new());
+        // And what is not there is not found.
+        assert_eq!(found("rohozkoux"), Vec::<usize>::new());
     }
 
     #[test]
