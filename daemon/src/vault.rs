@@ -292,7 +292,10 @@ mod header {
     const MAX_ARGON2_WORK: u128 = (64 << 20) * 1_000;
 
     const KDBX_SIGNATURE: [u8; 8] = [0x03, 0xd9, 0xa2, 0x9a, 0x67, 0xfb, 0x4b, 0xb5];
+    /// The AES derivation has two names. KDBX 4 files carry the second; the crate takes
+    /// either one in them.
     const AES_KDF: [u8; 16] = *b"\xc9\xd9\xf3\x9a\x62\x8a\x44\x60\xbf\x74\x0d\x08\xc1\x8a\x4f\xea";
+    const AES_KDF_KDBX4: [u8; 16] = *b"\x7c\x02\xbb\x82\x79\xa7\x4a\xc0\x92\x7d\x11\x4a\x00\x64\x82\x38";
     const ARGON2D: [u8; 16] = *b"\xef\x63\x6d\xdf\x8c\x29\x44\x4b\x91\xf7\xa9\xa4\x03\xe3\x0a\x0c";
     const ARGON2ID: [u8; 16] = *b"\x9e\x29\x8b\x19\x56\xdb\x47\x73\xb2\x3d\xfc\x3e\xc6\xf0\xa1\xe6";
 
@@ -407,7 +410,7 @@ mod header {
     fn check_kdf(params: &[(String, Value)]) -> Result<(), VaultError> {
         let get = |name: &str| params.iter().find(|(k, _)| k == name).map(|(_, v)| v);
         let Some(Value::Bytes(uuid)) = get("$UUID") else { return Ok(()) };
-        if uuid[..] == AES_KDF {
+        if uuid[..] == AES_KDF || uuid[..] == AES_KDF_KDBX4 {
             if let Some(Value::U64(rounds)) = get("R")
                 && *rounds > MAX_AES_ROUNDS
             {
@@ -532,15 +535,18 @@ mod header {
             assert_eq!(check(&argon(64 << 20, 100_000, 1)), Err(too_expensive()));
             assert_eq!(check(&argon(64 << 20, 1, 1 << 20)), Err(too_expensive()));
             assert_eq!(check(&argon(4 << 30, 1_000, 1)), Err(too_expensive()));
-            let aes = |rounds: u64| {
-                kdbx4(&[
-                    ("$UUID", Value::Bytes(AES_KDF.to_vec())),
-                    ("S", Value::Bytes(vec![0; 32])),
-                    ("R", Value::U64(rounds)),
-                ])
-            };
-            check(&aes(60_000_000)).unwrap();
-            assert_eq!(check(&aes(u64::MAX)), Err(too_expensive()));
+            // Under either of its two names.
+            for name in [AES_KDF, AES_KDF_KDBX4] {
+                let aes = |rounds: u64| {
+                    kdbx4(&[
+                        ("$UUID", Value::Bytes(name.to_vec())),
+                        ("S", Value::Bytes(vec![0; 32])),
+                        ("R", Value::U64(rounds)),
+                    ])
+                };
+                check(&aes(60_000_000)).unwrap();
+                assert_eq!(check(&aes(u64::MAX)), Err(too_expensive()));
+            }
             // A u64 parameter that is only 2 bytes long would panic the crate's reader.
             let short = kdbx4(&[("$UUID", Value::Bytes(AES_KDF.to_vec())), ("R", Value::Other)]);
             let mut short = short;

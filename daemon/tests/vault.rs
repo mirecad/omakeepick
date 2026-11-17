@@ -432,6 +432,31 @@ async fn the_helper_reads_the_files_before_it_is_given_credentials() {
     std::fs::write(&path, absurd).unwrap();
     let refused = read(&path, None).await;
     assert!(matches!(refused, Some(VaultError::Format(_))), "{refused:?}");
+
+    // The same in KDBX 4, where the rounds are the parameter "R" and the AES derivation has a
+    // second name. KeePassXC writes that one; the crate writes the first and reads both.
+    let written =
+        kdbx4_copy(dir.path(), "aes4.kdbx", KdfConfig::Aes { rounds: 3 }, OuterCipherConfig::ChaCha20);
+    let written = std::fs::read(written).unwrap();
+    let names: [[u8; 16]; 2] = [
+        *b"\xc9\xd9\xf3\x9a\x62\x8a\x44\x60\xbf\x74\x0d\x08\xc1\x8a\x4f\xea",
+        *b"\x7c\x02\xbb\x82\x79\xa7\x4a\xc0\x92\x7d\x11\x4a\x00\x64\x82\x38",
+    ];
+    let name_at = written.windows(16).position(|w| w == names[0]).expect("the crate's name for AES");
+    let rounds = [0x05, 1, 0, 0, 0, b'R', 8, 0, 0, 0];
+    let rounds_at = written.windows(rounds.len()).position(|w| w == rounds).unwrap() + rounds.len();
+    assert_eq!(written[rounds_at..rounds_at + 8], 3u64.to_le_bytes());
+    for name in names {
+        let mut absurd = written.clone();
+        absurd[name_at..name_at + 16].copy_from_slice(&name);
+        // With the rounds it was written with, the header passes under either name.
+        std::fs::write(&path, &absurd).unwrap();
+        assert_eq!(read(&path, None).await, None);
+        absurd[rounds_at..rounds_at + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        std::fs::write(&path, &absurd).unwrap();
+        let refused = read(&path, None).await;
+        assert!(matches!(refused, Some(VaultError::Format(_))), "{refused:?}");
+    }
 }
 
 /// The daemon's half of that order: it writes no credential until the helper has reported the
