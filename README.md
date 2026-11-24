@@ -207,10 +207,14 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
     thousand entries) is refused, which keeps it to about two thirds of a second at worst
     and a few milliseconds for an ordinary database. The search index is built in the same
     go. It takes a fixed length of every text at most and a group's path once, however many
-    entries the group has, so it is no larger than the hand-over allows either.
-  - Nothing waits for a search. How long one takes goes by how much text the database has,
-    so the daemon searches for two milliseconds at a time and attends to everything else in
-    between. A lock that arrives in the middle ends the search.
+    entries the group has, so it stays in proportion to the hand-over. The helper also cuts
+    each entry's tags to what the index takes: a tag is one byte of file and far more than
+    that in memory.
+  - A lock does not wait for a search to end. How long one takes goes by how much text the
+    database has, so the daemon searches for two milliseconds at a time (and to the end of
+    the entry it is on) and attends to everything else in between. A lock that arrives in
+    the middle ends the search, and so does a newer search, so there is never more than one
+    to wait a step for.
   - The file does not decide how much memory the helper takes. A KeePass database is saved
     compressed, and nothing in the file says what it unpacks to: a megabyte of file can hold
     a gigabyte of attachment, and the parser unpacks all of it before anything can be left

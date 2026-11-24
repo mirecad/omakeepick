@@ -269,6 +269,21 @@ pub fn strip(db: &mut Database) {
     // not by the tracks, which the line above has left pointing at versions that are gone.
     db.remove_unused_attachments();
     db.deleted_objects.clear();
+    // Tags: a list of strings in memory, each of which costs twenty-four bytes and more
+    // however short it is, and a tag in the file can be one separator. Entries keep the tags
+    // that the index takes; groups keep none, since nothing reads them.
+    db.foreach_entry_mut(|mut entry| {
+        let mut room = MAX_INDEXED_TEXT_BYTES;
+        entry.tags.retain(|tag| {
+            let fits = !tag.is_empty() && tag.len() <= room;
+            if fits {
+                room -= tag.len();
+            }
+            fits
+        });
+        entry.tags.shrink_to_fit();
+    });
+    db.foreach_group_mut(|mut group| group.tags = Vec::new());
 }
 
 /// Runs the KDF, so call it from a blocking thread.

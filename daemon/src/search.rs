@@ -43,20 +43,23 @@ pub fn frecency(usage: Option<&(u32, i64)>, now: i64) -> u32 {
     (f64::from(count).ln_1p() * 120.0 * 0.5f64.powf(age_days / 30.0)) as u32
 }
 
-/// Put after a text in which a substring is looked for. nucleo 0.3.1 does not try the last
-/// place a substring can start at in a text that is not plain ASCII, so it never finds a word
-/// that the text ends with. With this after it, no word is at the end. A query cannot contain
-/// it: the daemon takes queries apart at white space.
-const END: char = '\n';
+/// Put after a text in which a substring is looked for, because of two faults in nucleo
+/// 0.3.1. In a text that is not plain ASCII it does not try the last place a substring can
+/// start at, so it never finds a word that the text ends with. In a text that is plain ASCII
+/// it looks for some words (`24h`, `10gb`: a letter after two or more other characters)
+/// without folding case and short of the end. With this after it no word is at the end, and
+/// no text is plain ASCII. A query cannot contain the line feed: the daemon takes queries
+/// apart at white space.
+const END: &str = "\n¶";
 
 /// `text` in lower case, with [`END`] after it if `end` says so, in a buffer that is wiped and
 /// that never moves while it is filled, which would leave the beginning of the text behind in
 /// freed memory: a character's lower case is never more than twice as long as the character.
 fn lower_case(text: &str, end: bool) -> Zeroizing<String> {
-    let mut lower = Zeroizing::new(String::with_capacity(text.len() * 2 + END.len_utf8()));
+    let mut lower = Zeroizing::new(String::with_capacity(text.len() * 2 + END.len()));
     lower.extend(text.chars().flat_map(char::to_lowercase));
     if end {
-        lower.push(END);
+        lower.push_str(END);
     }
     lower
 }
@@ -110,10 +113,11 @@ impl Searcher {
         // nucleo folds case only for some non-ASCII letters (`Ž` stays unmatched by `z`), so
         // lowercase those haystacks first; its normalization then maps `ž` to `z`.
         let folded;
-        let haystack = if haystack.is_ascii() {
+        let substring = atom.kind == AtomKind::Substring;
+        let haystack = if haystack.is_ascii() && !substring {
             haystack
         } else {
-            folded = lower_case(haystack, atom.kind == AtomKind::Substring);
+            folded = lower_case(haystack, substring);
             folded.as_str()
         };
         atom.score(Utf32Str::new(haystack, &mut self.buf), &mut self.matcher).map(u32::from)
@@ -159,8 +163,8 @@ impl Searcher {
             .flat_map(|e| [&*e.title, &*e.username, &*e.url_match, &*e.group, &*e.tags, &**e.notes])
             .map(str::len)
             .max();
-        // A text has no more characters than bytes, in lower case too; one more for `END`.
-        self.buf.reserve(longest.unwrap_or(0) + 1);
+        // A text has no more characters than bytes, in lower case too; two more for `END`.
+        self.buf.reserve(longest.unwrap_or(0) + 2);
     }
 
     /// Scores the entries of `index` from `from` on and keeps the ones that match. `enough`
@@ -304,10 +308,10 @@ mod tests {
         let text = "İstanbul ȺȾ Žilina";
         let lower = lower_case(text, false);
         assert_eq!(lower.as_str(), "i\u{307}stanbul ⱥⱦ žilina");
-        assert_eq!(lower.capacity(), text.len() * 2 + 1);
+        assert_eq!(lower.capacity(), text.len() * 2 + END.len());
         let ended = lower_case(text, true);
-        assert_eq!(ended.as_str(), "i\u{307}stanbul ⱥⱦ žilina\n");
-        assert_eq!(ended.capacity(), text.len() * 2 + 1);
+        assert_eq!(ended.as_str(), "i\u{307}stanbul ⱥⱦ žilina\n¶");
+        assert_eq!(ended.capacity(), text.len() * 2 + END.len());
     }
 
     /// A word that a text ends with is found, in a text that is not plain ASCII as much as in
@@ -334,6 +338,26 @@ mod tests {
         assert_eq!(found("kancelaria$"), Vec::<usize>::new());
         // And what is not there is not found.
         assert_eq!(found("rohozkoux"), Vec::<usize>::new());
+
+        // In plain ASCII: words with a letter after two or more other characters, at the end
+        // of a text, in another case, and asked not to be there.
+        let index = vec![
+            entry("Open 24h", "", "", "", "open 24h"),
+            entry("Shop", "", "", "", "Open 24H daily, limit 10GB per day"),
+            entry("Genes", "", "", "", "my 23andMe login"),
+            entry("İstanbul", "", "", "", ""),
+        ];
+        let found = |query: &str| {
+            let mut hits = Searcher::default().search(&index, query, &Usage::new(), 10, 0, 0).0;
+            hits.sort();
+            hits
+        };
+        assert_eq!(found("24h"), [0, 1]);
+        assert_eq!(found("'24h"), [0, 1]);
+        assert_eq!(found("10gb"), [1]);
+        assert_eq!(found("23andme"), [2]);
+        assert_eq!(found("!24h"), [2, 3]);
+        assert_eq!(found("'istanbul"), [3]);
     }
 
     #[test]

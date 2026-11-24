@@ -382,6 +382,8 @@ pub struct Daemon {
     /// while they run, and the helpers and tools they started until those are gone.
     /// `lock_and_settle` waits for all of it, so suspend is not allowed while any exists.
     inflight: Tracker,
+    /// Counts the searches that were started. A search that is no longer the newest ends.
+    searches: std::sync::atomic::AtomicU64,
 }
 
 impl Daemon {
@@ -407,6 +409,7 @@ impl Daemon {
             }),
             events,
             idle_wakeup: Notify::new(),
+            searches: std::sync::atomic::AtomicU64::new(0),
             quit: Notify::new(),
             clipboard: Clipboard::new(inflight.clone()),
             reload_tx,
@@ -737,7 +740,9 @@ impl Daemon {
     /// How long a search takes goes by the text in the database. It is done a step at a time
     /// on the one runtime thread, and everything else gets a turn between the steps. A lock
     /// that comes in the middle ends the search at its next step, and the entries it was
-    /// working on (their notes are wiped when dropped) go with it.
+    /// working on (their notes are wiped when dropped) go with it. So does a newer search:
+    /// only one is ever more than a step from its end, however many were asked for, and what
+    /// waits for its turn waits for one step, not for one of each.
     async fn search(self: &Arc<Self>, a: SearchArgs) -> Reply {
         if a.query.len() > MAX_QUERY_BYTES {
             return Err(ApiError::bad_request("The query is too long"));
@@ -745,12 +750,19 @@ impl Daemon {
         let query: String = a.query.split_whitespace().take(MAX_QUERY_ATOMS).collect::<Vec<_>>().join(" ");
         let query = Query::parse(&query);
         let limit = a.limit.unwrap_or(50).clamp(1, 500);
+        use std::sync::atomic::Ordering;
         let (index, usage, recent, epoch) = {
-            let core = self.core();
+            let mut core = self.core();
+            let core = &mut *core;
             let Some(open) = &core.open else { return Err(ApiError::locked()) };
             let usage = core.store.usage(&open.path).cloned().unwrap_or_default();
-            (open.index.entries(), usage, core.settings.recent_count, core.epoch)
+            let taken = (open.index.entries(), usage, core.settings.recent_count, core.epoch);
+            // Asking counts as use, whether or not the search gets to its end.
+            core.touch();
+            taken
         };
+        self.idle_wakeup.notify_one();
+        let mine = self.searches.fetch_add(1, Ordering::Relaxed) + 1;
         // A suspend waits until this has let go of the entries.
         let _inflight = self.inflight.hold();
         let now = unix_now();
@@ -770,6 +782,9 @@ impl Daemon {
                 tokio::task::yield_now().await;
                 if !self.still(epoch) {
                     return Err(ApiError::locked());
+                }
+                if self.searches.load(Ordering::Relaxed) != mine {
+                    return Err(ApiError::new("cancelled", "A newer search took its place"));
                 }
             }
             searcher.best(&index, limit)

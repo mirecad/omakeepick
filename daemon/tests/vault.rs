@@ -590,6 +590,32 @@ async fn a_database_that_unpacks_to_gigabytes_is_refused() {
     assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
 }
 
+/// A tag takes a byte of file and twenty-four bytes and more of memory, so a few kilobytes
+/// of file used to be hundreds of megabytes in the daemon. The helper hands over the tags the
+/// index takes and no others.
+#[tokio::test]
+async fn the_helper_hands_over_no_more_tags_than_the_index_takes() {
+    let mut db = Database::new();
+    {
+        let mut root = db.root_mut();
+        root.tags = vec![String::new(); 1000];
+        let mut entry = root.add_entry();
+        entry.set_unprotected(fields::TITLE, "Tagged");
+        entry.tags = vec![String::new(); 1_000_000];
+        entry.tags.extend(["work".to_string(), "mail".to_string()]);
+        entry.tags.extend((0..1000).map(|n| format!("tag-{n}")));
+    }
+    let handed_over = through_the_helper(&db).await.unwrap();
+    assert!(handed_over.iter_all_groups().all(|group| group.tags.is_empty()));
+    let tags = &handed_over.iter_all_entries().next().unwrap().tags;
+    assert_eq!(tags[..3], ["work", "mail", "tag-0"]);
+    assert!(tags.len() < 200 && tags.iter().map(String::len).sum::<usize>() <= vault::MAX_INDEXED_TEXT_BYTES);
+    assert_eq!(
+        vault::build_index(&handed_over)[0].tags.split(' ').take(2).collect::<Vec<_>>(),
+        ["work", "mail"]
+    );
+}
+
 /// The largest database that is accepted still opens under the helper's limit: a file near
 /// the size limit whose attachments do not compress, Argon2 at its gigabyte with as many
 /// threads as a header may ask for, and a key file of the largest size. It takes a gigabyte

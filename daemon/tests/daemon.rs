@@ -917,6 +917,16 @@ fn a_search_keeps_nothing_waiting() {
     // The search was long enough for the question to mean something.
     assert!(answers >= 10, "{answers} answers during a search of {took:?}");
 
+    // A newer search ends the ones before it: nobody is waiting for those any more, and
+    // each one under way is a step that everything else waits for.
+    let earlier: Vec<i64> = (0..8).map(|_| conn.send("search", query.clone())).collect();
+    std::thread::sleep(took / 8);
+    let newest = conn.send("search", query.clone());
+    for search in earlier {
+        assert_eq!(conn.reply(search)["error"], "cancelled");
+    }
+    assert_eq!(conn.reply(newest)["total"], 600);
+
     // A lock in the middle of a search does not wait for it, and ends it.
     let search = conn.send("search", query);
     std::thread::sleep(took / 4);

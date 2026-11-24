@@ -91,7 +91,7 @@ A `state` event is sent right after a client connects and after every state chan
 | `quickUnlock` | `pin` | `{}` | `no_quick_unlock`, `bad_pin` (+ `attemptsLeft`), `busy`, `cancelled` |
 | `lock` | `reason` (optional, `manual` default; `screen` from the lock-screen watcher) | `{}` | — |
 | `close` | — | `{}` | — |
-| `search` | `query` (string, at most 256 bytes; only the first 16 words count), `limit` (int, default 50, at most 500) | `{"entries": [Entry…], "total": n}` | `locked`, `bad_request` |
+| `search` | `query` (string, at most 256 bytes; only the first 16 words count), `limit` (int, default 50, at most 500) | `{"entries": [Entry…], "total": n}` | `locked`, `bad_request`, `cancelled` |
 | `act` | `entry` (entry id), `action` (see below) | `{}`; copy actions: `{"clearsIn": seconds, "copied": "password"}` | `locked`, `not_found`, `no_field`, `autotype_disabled`, `tool_missing`, `failed`, `cancelled` |
 | `pickFile` | `kind`: `db` or `keyfile` | `{"path": "/abs/path", "keyfile": "/abs/path" \| null}` (for `db`: the key file last used with that database) | `cancelled`, `failed` |
 | `touch` | — | `{}` | — |
@@ -101,7 +101,8 @@ A `state` event is sent right after a client connects and after every state chan
 (at most `recentCount` of them, possibly none). A search over a large database is done a
 little at a time, and other requests are answered in between: the replies to two searches
 can arrive in either order, so go by `id`. A lock that arrives while a search is under way
-ends it, and it fails with `locked`.
+ends it, and it fails with `locked`. A newer search, from any client, ends it too, and it
+fails with `cancelled`.
 
 A lock always wins over an unlock that is still running. If `lock`, `close` or an automatic
 lock (idle, screen lock, suspend) arrives while an `unlock` or `quickUnlock` is in progress, the
@@ -137,7 +138,8 @@ it waits the same way for up to 2 s.
 
 Never contains secrets: no password, notes, custom field values or TOTP secret. `title` and
 `username` are at most 1 KiB and `group` at most 256 bytes long: what is longer in the
-database is cut and marked with `…` (a group path at its beginning, the others at their end).
+database is cut and marked with `…` (a group path at its beginning, the others at their end;
+within a path, a single group's name is cut at 96 bytes).
 
 ```json
 {
