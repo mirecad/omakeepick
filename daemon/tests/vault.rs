@@ -461,19 +461,33 @@ async fn the_helper_reads_the_files_before_it_is_given_credentials() {
     }
 }
 
-/// How much writable memory the running process `pid` may have, as the kernel has it: the
-/// limit it can reach and the limit it could raise that to.
-fn memory_limit(pid: u32) -> (u64, u64) {
+/// A limit of the running process `pid` as the kernel has it, by its name in
+/// `/proc/<pid>/limits`: what it can reach and what it could raise that to.
+fn limit_of(pid: u32, name: &str) -> (u64, u64) {
     let limits = std::fs::read_to_string(format!("/proc/{pid}/limits")).unwrap();
-    let line = limits.lines().find(|line| line.starts_with("Max data size")).unwrap();
-    let mut numbers = line.split_whitespace().skip(3).map(|n| n.parse::<u64>().expect("a limit in bytes"));
+    let line = limits.lines().find(|line| line.starts_with(name)).unwrap();
+    let mut numbers =
+        line[name.len()..].split_whitespace().map(|n| n.parse::<u64>().expect("a limit in bytes"));
     (numbers.next().unwrap(), numbers.next().unwrap())
+}
+
+/// How much writable memory the running process `pid` may have.
+fn memory_limit(pid: u32) -> (u64, u64) {
+    limit_of(pid, "Max data size")
+}
+
+/// The helper behind a line of shell that runs first, e.g. `ulimit -d 1024`.
+fn helper_after(dir: &Path, name: &str, first: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join(name);
+    std::fs::write(&script, format!("#!/bin/sh\n{first}\nexec '{BIN}' \"$@\"\n")).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script
 }
 
 /// The helper is not trusted with memory: what a file unpacks to is up to the file. By the
 /// time it reports the files as read, and so before it is sent a credential, it has put a
-/// limit on itself that it cannot lift: a gigabyte, and what the header says the key
-/// derivation uses.
+/// limit on itself that it cannot lift. The limit is one number, the same for every file.
 #[tokio::test]
 async fn the_helper_limits_its_memory_before_it_is_given_credentials() {
     let dir = tempfile::tempdir().unwrap();
@@ -489,32 +503,53 @@ async fn the_helper_limits_its_memory_before_it_is_given_credentials() {
         },
         OuterCipherConfig::ChaCha20,
     );
-    for (path, kdf_memory) in [(fixture("password.kdbx"), 0), (argon, 16 << 20)] {
+    let limit = opener::HELPER_MEMORY_BYTES;
+    for path in [fixture("password.kdbx"), argon.clone()] {
         let mut opener = Opener::spawn(Path::new(BIN), &path, None).await.unwrap();
         opener.read().await.unwrap();
         let pid = opener.id().unwrap();
-        let limit = opener::HELPER_ROOM_BYTES + kdf_memory;
         assert_eq!(memory_limit(pid), (limit, limit), "{}", path.display());
-        // Should memory run out for some other reason, the kernel takes this process first.
-        let adjustment = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj")).unwrap();
-        assert_eq!(adjustment.trim(), "1000");
+        // The stack of its main thread, which that limit does not count, has one of its own.
+        let (stack, _) = limit_of(pid, "Max stack size");
+        assert!(stack <= 8 << 20, "{stack}");
         // Under the limit it does its work as before.
         let (db, _) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
         assert_eq!(vault::build_index(&db).len(), 7);
     }
 
-    // A session that allows its processes less than that is not a reason to fail, and its
-    // limit is not raised: the helper keeps the lower of the two.
-    use std::os::unix::fs::PermissionsExt;
+    // A session that allows its processes less than that is not a reason to fail, and what
+    // it allows is not raised, whether that is all it will ever allow or only for now.
     let lower = 512 << 20;
-    let limited = dir.path().join("limited-helper");
-    std::fs::write(&limited, format!("#!/bin/sh\nexec prlimit --data={lower} {BIN} \"$@\"\n")).unwrap();
-    std::fs::set_permissions(&limited, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut opener = Opener::spawn(&limited, &fixture("password.kdbx"), None).await.unwrap();
-    opener.read().await.unwrap();
-    assert_eq!(memory_limit(opener.id().unwrap()), (lower, lower));
-    let (db, _) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
+    for first in ["ulimit -d 524288", "ulimit -S -d 524288"] {
+        let limited = helper_after(dir.path(), "limited-helper", first);
+        let mut opener = Opener::spawn(&limited, &fixture("password.kdbx"), None).await.unwrap();
+        opener.read().await.unwrap();
+        assert_eq!(memory_limit(opener.id().unwrap()), (lower, lower), "{first}");
+        let (db, _) = opener.decrypt(password(PASSWORD)).await.unwrap().unseal().unwrap();
+        assert_eq!(vault::build_index(&db).len(), 7);
+    }
+
+    // The threads of a key derivation get stacks of a size that is set here: 256 of them fit
+    // in a limit that the 2 MiB each they would get otherwise are five times too much for,
+    // whatever the session says about the stacks of threads.
+    let small = helper_after(dir.path(), "small-helper", "ulimit -d 131072\nexport RUST_MIN_STACK=67108864");
+    let (db, _) = Opener::spawn(&small, &argon, None)
+        .await
+        .unwrap()
+        .decrypt(password(PASSWORD))
+        .await
+        .unwrap()
+        .unseal()
+        .unwrap();
     assert_eq!(vault::build_index(&db).len(), 7);
+
+    // A database that the session's limit is too low for gets the answer, not a crash, even
+    // when that is found out while the file is read.
+    let big = dir.path().join("big.kdbx");
+    std::fs::write(&big, vec![0u8; 64 << 20]).unwrap();
+    let tiny = helper_after(dir.path(), "tiny-helper", "ulimit -d 32768");
+    let refused = Opener::spawn(&tiny, &big, None).await.unwrap().read().await.err();
+    assert!(matches!(&refused, Some(VaultError::Format(m)) if m.contains("more memory")), "{refused:?}");
 }
 
 /// A database is saved compressed, and nothing in the file says what it unpacks to: two
@@ -525,7 +560,7 @@ async fn the_helper_limits_its_memory_before_it_is_given_credentials() {
 async fn a_database_that_unpacks_to_gigabytes_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let kdf_memory = 8 << 20;
-    let limit = opener::HELPER_ROOM_BYTES + kdf_memory;
+    let limit = opener::HELPER_MEMORY_BYTES;
 
     // The same file with a megabyte attached opens, and the attachment stays behind in the
     // helper. So nothing but the size is wrong with the one after it.
@@ -547,9 +582,55 @@ async fn a_database_that_unpacks_to_gigabytes_is_refused() {
     assert_eq!(memory_limit(opener.id().unwrap()), (limit, limit));
     let started = std::time::Instant::now();
     let refused = opener.decrypt(password(PASSWORD)).await.err();
-    assert_eq!(refused, Some(VaultError::Format("it takes more than 1 GiB of memory to open".into())));
+    assert_eq!(
+        refused,
+        Some(VaultError::Format("it takes more memory to open than the 1.5 GiB this app gives it".into()))
+    );
     // It ends where the limit is, well before the two minutes an unlock may take.
     assert!(started.elapsed() < std::time::Duration::from_secs(30), "{:?}", started.elapsed());
+}
+
+/// The largest database that is accepted still opens under the helper's limit: a file near
+/// the size limit whose attachments do not compress, Argon2 at its gigabyte with as many
+/// threads as a header may ask for, and a key file of the largest size. It takes a gigabyte
+/// in this process as well, to write the file, so it is run by hand:
+/// `cargo test --release --test vault -- --ignored the_largest`.
+#[tokio::test]
+#[ignore]
+async fn the_largest_database_that_is_accepted_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let keyfile = dir.path().join("large.key");
+    let mut random = vec![0u8; 16 << 20];
+    getrandom::fill(&mut random).unwrap();
+    std::fs::write(&keyfile, &random).unwrap();
+    let mut db = Database::new();
+    {
+        let mut root = db.root_mut();
+        for i in 0..15 {
+            let mut entry = root.add_entry();
+            entry.set_unprotected(fields::TITLE, format!("Entry {i}"));
+            let mut attached = vec![0u8; 8 << 20];
+            getrandom::fill(&mut attached).unwrap();
+            entry.add_attachment("blob", Value::unprotected(attached));
+        }
+    }
+    db.config.version = DatabaseVersion::KDB4(1);
+    db.config.kdf_config = KdfConfig::Argon2id {
+        iterations: 1,
+        memory: 1 << 30,
+        parallelism: 256,
+        version: rust_argon2::Version::Version13,
+    };
+    let path = dir.path().join("large.kdbx");
+    let key = DatabaseKey::new()
+        .with_password(PASSWORD)
+        .with_keyfile(&mut std::fs::File::open(&keyfile).unwrap())
+        .unwrap();
+    db.save(&mut std::fs::File::create(&path).unwrap(), key).unwrap();
+    drop(db);
+    assert!(std::fs::metadata(&path).unwrap().len() > 120 << 20);
+    let (db, _) = open_in_helper(&path, Some(&keyfile), password(PASSWORD)).await.unwrap();
+    assert_eq!((db.num_entries(), db.num_attachments()), (15, 0));
 }
 
 /// The daemon's half of that order: it writes no credential until the helper has reported the

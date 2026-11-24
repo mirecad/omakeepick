@@ -120,10 +120,10 @@ a second's worth, or a single key if keys are set slower than that. A copied val
 the clipboard by the lock itself, by killing the `wl-copy` that holds it.
 
 An unlock whose database or key file cannot be read within 30 s fails with `failed`, and so
-does one whose database file is over 128 MiB. A database fails with `format_error` if its key
-derivation settings are beyond what is accepted (Argon2 over 1 GiB of memory among them), if
-it takes more than 1 GiB of memory to open beside its key derivation, or if it has more than
-32 MiB of entries. A reload that fails keeps the database that was open and sends a `warning`
+does one whose database file is over 128 MiB. A database fails with `format_error` if it is
+not KDBX 3.1 or 4, if its key derivation settings are beyond what is accepted (Argon2 over
+1 GiB of memory, AES over 2^31 rounds), if it takes more than 1.5 GiB of memory to open, or if
+it has more than 32 MiB of entries. A reload that fails keeps the database that was open and sends a `warning`
 notice.
 From the moment logind announces a sleep until it reports the wake-up, `unlock` and
 `quickUnlock` are refused with `cancelled`: such a request starts after the sleep's lock, which

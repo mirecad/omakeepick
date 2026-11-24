@@ -3,20 +3,24 @@
 //! The helper parses a file that somebody else may have written, with a parser that takes the
 //! file at its word. A compressed database unpacks to whatever its contents unpack to, and a
 //! megabyte of zeros takes a kilobyte of file. So the helper is not trusted to be careful with
-//! memory. The kernel is told how much it may have ([`limit`], which is `RLIMIT_DATA`), before
-//! it is given a credential, and an allocation past that fails wherever in the parser it is
-//! made.
+//! memory. The first thing it does is have the kernel limit what it may have ([`limit`]), to
+//! a number that is in the code and that nothing in a file can move. An allocation past that
+//! fails wherever in the parser it is made.
 //!
-//! `RLIMIT_DATA` rather than `RLIMIT_AS`: it counts the memory a process can write to (the heap
-//! and every private writable mapping, thread stacks among them; since Linux 4.7), which is
-//! what can fill RAM. `RLIMIT_AS` also counts address space that is only reserved, and glibc
-//! reserves 64 MiB of it for every thread that allocates.
+//! The limit is `RLIMIT_DATA`, which since Linux 4.7 counts every private mapping a process
+//! can write to: the heap, what `mmap` gives the allocator for large blocks, and the stacks of
+//! threads. That is what a parser can fill. It does not count the stack of the main thread,
+//! which gets a limit of its own here, nor mappings shared with other processes, of which the
+//! helper makes none. `RLIMIT_AS` would count address space that is only reserved as well, and
+//! glibc reserves 64 MiB of it for every thread that allocates.
 //!
 //! A Rust program aborts when an allocation fails. In the helper it should be an answer
 //! instead: this database needs more memory than it is given. So the allocator of this binary
-//! is the system's with one addition. Once [`limit`] has been called, a refused allocation
-//! writes the report it was given to stderr and exits. In the daemon, which sets no limit,
-//! nothing differs from the system allocator.
+//! is the system's with one addition. Once [`limit`] has been called, an allocation that the
+//! system's allocator refuses makes the process write the report it was given to stderr and
+//! exit. (What is refused elsewhere still ends the process, without the report: a thread that
+//! glibc cannot give a stack, for one.) In the daemon, which sets no limit, nothing differs
+//! from the system allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::OnceLock;
@@ -24,32 +28,63 @@ use std::sync::OnceLock;
 /// What a process that ran into its limit writes to stderr before it exits.
 static REPORT: OnceLock<&'static [u8]> = OnceLock::new();
 
+/// What the stack of the main thread may grow to: the usual 8 MiB, in case the session this
+/// was started from has no limit on it.
+const STACK_BYTES: u64 = 8 << 20;
+
 /// Lets this process have `bytes` of writable memory and no more, for good: the limit cannot
-/// be raised again. A limit it was started under that is lower still stays as it is. From
-/// here on an allocation that the kernel refuses ends the process with `report` on stderr and
-/// exit status 1.
+/// be raised again. A limit it was started under that is lower still, soft or hard, stays as
+/// it is. From here on an allocation that the system's allocator refuses ends the process with
+/// `report` on stderr and exit status 1.
+///
+/// Fails, and nothing should be parsed then, if the limit cannot be set or the kernel does not
+/// hold to it.
 pub fn limit(bytes: u64, report: &'static [u8]) -> std::io::Result<()> {
-    let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_DATA, &mut limit) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let bytes = bytes.min(limit.rlim_max);
-    let limit = libc::rlimit { rlim_cur: bytes, rlim_max: bytes };
-    if unsafe { libc::setrlimit(libc::RLIMIT_DATA, &limit) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    // First, so that running into a limit the session set is answered the same way.
     let _ = REPORT.set(report);
+    let bytes = lower(libc::RLIMIT_DATA, bytes)?;
+    lower(libc::RLIMIT_STACK, STACK_BYTES)?;
+    if !refuses_more_than(bytes) {
+        return Err(std::io::Error::other("this kernel does not enforce RLIMIT_DATA"));
+    }
     Ok(())
 }
 
-/// Makes this process the one the kernel kills first when the machine runs out of memory.
-/// The limit keeps the helper from causing that; this is for the case where memory is short
-/// anyway, so that it costs an unlock and not a window.
-///
-/// Call it before `harden::harden_process`: the files under `/proc/self` of a process that is
-/// not dumpable belong to root.
-pub fn first_to_go() {
-    let _ = std::fs::write("/proc/self/oom_score_adj", "1000");
+/// Sets both limits of `resource` to `bytes`, or to what they are if that is less. Returns
+/// what it set.
+fn lower(resource: libc::__rlimit_resource_t, bytes: u64) -> std::io::Result<u64> {
+    let mut now = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(resource, &mut now) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let bytes = bytes.min(now.rlim_cur).min(now.rlim_max);
+    let limit = libc::rlimit { rlim_cur: bytes, rlim_max: bytes };
+    if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(bytes)
+}
+
+/// Whether the kernel says no to a writable mapping of more than `bytes`. A kernel older than
+/// 4.7, or one booted with `ignore_rlimit_data`, takes the limit and then does not hold to it.
+fn refuses_more_than(bytes: u64) -> bool {
+    let Ok(len) = usize::try_from(bytes.saturating_add(4096)) else { return true };
+    // Not touched, so nothing is used even where it is granted.
+    let granted = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        )
+    };
+    if granted == libc::MAP_FAILED {
+        return true;
+    }
+    unsafe { libc::munmap(granted, len) };
+    false
 }
 
 /// The system allocator, which in a process under [`limit`] reports a refusal and exits.

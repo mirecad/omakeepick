@@ -735,8 +735,23 @@ fn reloads_when_the_file_changes() {
 /// as a sync peer could do it, it is not loaded, and the one that was open stays open.
 #[test]
 fn a_database_that_unpacks_to_gigabytes_is_not_opened() {
+    use std::os::unix::process::CommandExt;
     let env = Env::new();
-    let _daemon = env.serve();
+    // The daemon and with it its helpers under a limit from outside, a little above the one
+    // a helper sets itself. Should that one ever be missing, this test fails there and does
+    // not fill the memory of the machine it runs on.
+    let mut serve = env.command(&["serve"]);
+    let outside: libc::rlim_t = 2 << 30;
+    unsafe {
+        serve.pre_exec(move || {
+            let limit = libc::rlimit { rlim_cur: outside, rlim_max: outside };
+            match libc::setrlimit(libc::RLIMIT_DATA, &limit) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        });
+    }
+    let _daemon = env.serve_with(serve);
     let mut conn = env.connect();
     let unpacks_to_gigabytes = kdbx4::with_attachment(PASSWORD, 2 << 30, 8 << 20);
 
@@ -746,7 +761,7 @@ fn a_database_that_unpacks_to_gigabytes_is_not_opened() {
     assert_eq!((refused["ok"].clone(), refused["error"].clone()), (json!(false), json!("format_error")));
     assert_eq!(
         refused["message"],
-        "Not a readable KeePass database: it takes more than 1 GiB of memory to open"
+        "Not a readable KeePass database: it takes more memory to open than the 1.5 GiB this app gives it"
     );
     assert_eq!(conn.request("search", json!({"query": "git"}))["error"], "locked");
 

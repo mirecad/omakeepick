@@ -214,13 +214,12 @@ TOTP works with KeePassXC's `otp` field (`otpauth://` URIs, including Steam), Ke
   - The file does not decide how much memory the helper takes. A KeePass database is saved
     compressed, and nothing in the file says what it unpacks to: a megabyte of file can hold
     a gigabyte of attachment, and the parser unpacks all of it before anything can be left
-    out. So before the helper is given the password, it has the kernel limit its memory
-    (`RLIMIT_DATA`, which it cannot raise again) to 1 GiB plus what the file's key derivation
-    is set to use. That setting is itself refused above 1 GiB. A database that needs more is
+    out. So the first thing the helper does, before it reads anything, is have the kernel
+    limit its memory to 1.5 GiB (`RLIMIT_DATA`, which it cannot raise again). The number is
+    the same for every file. A key derivation that asks for more than 1 GiB is refused from
+    the header, so the derivation fits in it. A database that needs more than the limit is
     not opened, and the unlock says so. The same goes for one that a sync peer saves over
-    the database you have open: it is not loaded, and the one you had stays. Should the
-    machine be short of memory for other reasons, the helper is the process the kernel
-    takes first.
+    the database you have open: it is not loaded, and the one you had stays.
   - Copying and typing hold as little as they can, and a lock ends them wherever they are.
     - Auto-type takes a field's value from the database when that field's turn comes, and
       drops it once it is typed. The wait before typing, a `{DELAY}` and the key presses in
@@ -273,15 +272,17 @@ Found a vulnerability? Please report it privately, as described in [SECURITY.md]
 ## Limitations
 
 - KDBX 3.1 and 4.x with a password and/or a key file are supported (XML v1/v2, 32/64-byte and
-  arbitrary key files). YubiKey challenge-response is not supported yet.
+  arbitrary key files). YubiKey challenge-response is not supported yet. Files in the format
+  of KeePass 1 (`.kdb`) are refused.
 - Screen-lock detection asks Omarchy's lock screen every 10 seconds, so a very short lock may
   not lock the database. Suspend and `loginctl lock-session` are detected instantly.
 - One database at a time, with at most 32 MiB of entries (some forty thousand), not counting
   attachments and entry histories.
-- The database file can be up to 128 MiB, and opening it can take up to 1 GiB of memory,
-  not counting its key derivation. That is enough for any file of that size whose attachments
-  do not compress. Attachments that compress well fit up to a few hundred megabytes unpacked.
-- Argon2 is accepted with up to 1 GiB of memory (KeePassXC's default is 64 MiB).
+- The database file can be up to 128 MiB, and opening it can take up to 1.5 GiB of memory.
+  That is enough for any file of that size whose attachments do not compress. Attachments
+  that compress well fit up to a few hundred megabytes unpacked.
+- Argon2 is accepted with up to 1 GiB of memory (KeePassXC's default is 64 MiB), and the AES
+  key derivation with up to 2^31 rounds, about half a minute of one core.
 - Search looks at the first 16 KiB of an entry's notes and the first 1 KiB of its title, user
   name, URL and tags. A group path longer than 256 bytes is shown, and searched, from its end.
 
